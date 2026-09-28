@@ -1,0 +1,33 @@
+import ast
+import std.io
+
+use ast.NodeKind
+
+export struct Evaluator {}
+
+impl Evaluator {
+    export fun new() -> Evaluator {
+        return Evaluator {}
+    }
+
+    export fun eval(self, node: ast.Node) -> i32 {
+        match node.kind {
+            NodeKind::Num(n) => {
+                return n
+            },
+            _ => {}
+        }
+
+        left := self.eval(node.left.unwrap())
+        right := self.eval(node.right.unwrap())
+
+        return match node.kind {
+            NodeKind::Add => left + right,
+            NodeKind::Sub => left - right,
+            NodeKind::Mul => left * right,
+            NodeKind::Div => left / right,
+
+            NodeKind::Num(_) => __unreachable(),
+        }
+    }
+}

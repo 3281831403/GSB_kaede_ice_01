@@ -1,0 +1,101 @@
+import std.ffi.sys
+import std.io
+import std.result
+
+use std.io.IoError
+use std.io.IoErrorKind
+use std.result.Result
+
+use std.ffi.sys.__sys_read
+use std.ffi.sys.__sys_write
+use std.ffi.sys.__sys_errno
+use std.ffi.sys.__sys_fsync
+use std.ffi.sys.__sys_fdatasync
+use std.ffi.sys.__sys_close
+use std.ffi.sys.__sys_sleep_ms
+
+export struct Fd {
+    raw: i32,
+}
+
+impl Fd {
+    export fun new(fd: i32) -> Fd {
+        return Fd { raw: fd }
+    }
+
+    export fun raw(self) -> i32 {
+        return self.raw
+    }
+
+    export fun read(self, buf: mut [u8]) -> Result<u64, IoError> {
+        let n = __sys_read(self.raw, buf.as_ptr(), buf.len())
+        if n < 0 {
+            return Result::Err(IoError::from_errno(__sys_errno()))
+        }
+        return Result::Ok(n as u64)
+    }
+
+    export fun write(self, buf: [u8]) -> Result<u64, IoError> {
+        let mut off = 0
+        let total = buf.len()
+
+        while off < total {
+            // Short writes are normal on sockets, so keep advancing until all bytes
+            // are written or the syscall reports failure.
+            let ptr = __ptr_add(buf.as_ptr(), off)
+            let rem = total - off
+
+            let n = __sys_write(self.raw, ptr, rem)
+
+            if n < 0 {
+                return Result::Err(IoError::from_errno(__sys_errno()))
+            }
+
+            if n == 0 {
+                // Zero-length write usually means the peer is gone. There's no
+                // dedicated errno here, so report it as a broken pipe.
+                return Result::Err(IoError::new(IoErrorKind::BrokenPipe, 0))
+            }
+
+            off += n as u64
+        }
+
+        return Result::Ok(total)
+    }
+
+    export fun sync_all(self) -> Result<bool, IoError> {
+        if __sys_fsync(self.raw) < 0 {
+            return Result::Err(IoError::from_errno(__sys_errno()))
+        }
+        return Result::Ok(true)
+    }
+
+    export fun sync_data(self) -> Result<bool, IoError> {
+        if __sys_fdatasync(self.raw) < 0 {
+            return Result::Err(IoError::from_errno(__sys_errno()))
+        }
+        return Result::Ok(true)
+    }
+}
+
+export fun errno() -> i32 {
+    return __sys_errno()
+}
+
+export fun close(fd: Fd) {
+    let r = __sys_close(fd.raw)
+    if r < 0 {
+        panic("close failed")
+    }
+}
+
+export fun close_quiet(fd: Fd) -> bool {
+    return __sys_close(fd.raw) == 0
+}
+
+export fun sleep_ms(ms: u64) {
+    let r = __sys_sleep_ms(ms)
+    if r < 0 {
+        panic("sleep_ms failed")
+    }
+}

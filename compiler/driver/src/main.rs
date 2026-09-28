@@ -1,0 +1,536 @@
+use core::panic;
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use anyhow::{anyhow, Context as _};
+use colored::Colorize;
+use inkwell::{context::Context, module::Module, OptimizationLevel};
+use kaede_ast::{top::TopLevelKind, ModuleItem};
+use kaede_codegen::{error::CodegenError, CodeGenerator, CodegenCtx};
+use kaede_common::{
+    kaede_gc_lib_path, kaede_lib_path, kaede_runtime_lib_path, kaede_runtime_linker_flags,
+};
+use kaede_monomorphize::Monomorphizer;
+use kaede_parse::Parser;
+use kaede_semantic::{AnalyzeOptions, SemanticAnalyzer};
+use tempfile::{NamedTempFile, TempPath};
+
+mod build;
+mod manifest;
+mod new;
+mod run;
+
+use build::build_project;
+use new::create_new_project;
+use run::run_project;
+
+#[derive(clap::Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[arg(long, action)]
+    display_llvm_ir: bool,
+
+    #[arg(value_name = "FILE")]
+    files: Vec<PathBuf>,
+
+    #[arg(
+        short,
+        long,
+        help = "Instead of a file, we receive a program from the commandline argument"
+    )]
+    program: Option<String>,
+
+    #[arg(short = 'o')]
+    output: Option<PathBuf>,
+
+    #[arg(short = 'O', default_value_t = 2, help = "Optimization level (0-3)")]
+    opt_level: u8,
+
+    #[arg(
+        short = 'c',
+        action,
+        help = "Outputs object files without invoking the linker"
+    )]
+    c: bool,
+
+    #[arg(long, help = "Project root directory")]
+    root_dir: Option<PathBuf>,
+
+    // Do not load standard libraries that automatically load
+    // Will not be used except when building standard libraries
+    #[arg(long, action)]
+    no_autoload: bool,
+
+    #[arg(long, action)]
+    no_prelude: bool,
+
+    #[arg(long, action)]
+    no_gc: bool,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    /// Create a new Kaede project (optionally with Rust interop scaffold)
+    New {
+        /// Name of the project to create
+        project_name: String,
+        #[arg(long, action, help = "Generate Rust interop scaffolding")]
+        rust: bool,
+    },
+    /// Build a Kaede project
+    Build,
+    /// Build and run a Kaede project
+    Run {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Run Kaede Language Server
+    Lsp {
+        #[arg(long, action, hide = true)]
+        stdio: bool,
+    },
+}
+
+fn to_inkwell_opt_level(level: u8) -> OptimizationLevel {
+    match level {
+        0 => OptimizationLevel::None,
+        1 => OptimizationLevel::Less,
+        2 => OptimizationLevel::Default,
+        3 => OptimizationLevel::Aggressive,
+        _ => panic!("Optimization levels range from 0 to 3!"),
+    }
+}
+
+pub(crate) struct CompileUnitInfo {
+    pub file_path: PathBuf,
+    pub program: String,
+    pub is_entry_unit: bool,
+}
+
+fn ast_has_entry_candidate(ast: &kaede_ast::CompileUnit) -> bool {
+    ast.items.iter().any(|item| match item {
+        ModuleItem::Stmt(_) => true,
+        ModuleItem::Decl(top_level) => {
+            matches!(
+                &top_level.kind,
+                TopLevelKind::Fn(fn_) if fn_.decl.name.symbol().as_str() == "main"
+            )
+        }
+    })
+}
+
+fn is_entry_candidate(unit_info: &CompileUnitInfo) -> anyhow::Result<bool> {
+    let file = unit_info.file_path.clone().into();
+    let ast = Parser::new(&unit_info.program, file).run()?;
+
+    Ok(ast_has_entry_candidate(&ast))
+}
+
+pub(crate) fn select_entry_unit(unit_infos: &mut [CompileUnitInfo]) -> anyhow::Result<()> {
+    unit_infos
+        .iter_mut()
+        .for_each(|unit| unit.is_entry_unit = false);
+
+    let candidate_indices = unit_infos
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, unit)| match is_entry_candidate(unit) {
+            Ok(true) => Some(Ok(idx)),
+            Ok(false) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    match candidate_indices.as_slice() {
+        [] => Ok(()),
+        [idx] => {
+            unit_infos[*idx].is_entry_unit = true;
+            Ok(())
+        }
+        _ => {
+            let candidates = candidate_indices
+                .iter()
+                .map(|idx| unit_infos[*idx].file_path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Entry unit is ambiguous. Exactly one compile unit may contain top-level statements or `fun main`: {}",
+                candidates
+            )
+        }
+    }
+}
+
+fn emit_bitcode_to_tempfile(module: &Module) -> anyhow::Result<TempPath> {
+    let tempfile = NamedTempFile::new()?;
+
+    let temppath = tempfile.into_temp_path();
+
+    module.write_bitcode_to_path(&temppath);
+
+    Ok(temppath)
+}
+
+fn emit_object_file_to_tempfile(bitcode_path: &Path) -> anyhow::Result<TempPath> {
+    let tempfile = NamedTempFile::new()?;
+
+    let temppath = tempfile.into_temp_path();
+
+    let status = Command::new("llc")
+        .args([
+            "-filetype=obj",
+            "-relocation-model=pic", // Set relocation model
+            "-o",
+            &temppath.to_string_lossy(),
+            &bitcode_path.to_string_lossy(),
+        ])
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!("Failed to emit object file using 'llc'")
+    }
+
+    Ok(temppath)
+}
+
+fn emit_exe_file(
+    obj_path: &Path,
+    output_file_path: &Path,
+    additional_libs: &[PathBuf],
+) -> anyhow::Result<()> {
+    let mut args = vec![
+        OsString::from("-fPIE"), // Enable position-independent executable
+        OsString::from("-o"),
+        output_file_path.as_os_str().to_os_string(),
+        obj_path.as_os_str().to_os_string(),
+    ];
+
+    args.extend(kaede_runtime_linker_flags());
+
+    // Add additional libraries first (like Rust libraries)
+    for lib in additional_libs {
+        args.push(lib.as_os_str().to_os_string());
+    }
+
+    let kaede_lib_path = kaede_lib_path();
+    let kaede_gc_lib_path = kaede_gc_lib_path();
+    let kaede_runtime_lib_path = kaede_runtime_lib_path();
+    // Add standard libraries
+    args.push(kaede_lib_path.into_os_string()); // Link with standard library
+    args.push(kaede_runtime_lib_path.into_os_string()); // Link with runtime
+    args.push(kaede_gc_lib_path.into_os_string()); // Link with garbage collector
+    args.push(OsString::from("-pthread"));
+
+    let status = Command::new("cc").args(&args).status()?;
+
+    if !status.success() {
+        anyhow::bail!("Failed to emit executable file using 'cc'")
+    }
+
+    Ok(())
+}
+
+/// Compiles Kaede units and returns:
+/// - the merged LLVM module
+/// - additional native libraries discovered during semantic analysis
+///   (for example, generated Rust shim dylibs for `import rust::<crate>`)
+fn compile<'ctx>(
+    cgcx: &'ctx CodegenCtx<'_>,
+    unit_infos: Vec<CompileUnitInfo>,
+    root_dir: &'ctx Path,
+    rust_path: Option<&Path>,
+    no_autoload: bool,
+    no_prelude: bool,
+) -> anyhow::Result<(Module<'ctx>, Vec<PathBuf>)> {
+    let mut compiled_modules = Vec::new();
+    let mut additional_native_libs = Vec::new();
+
+    for unit_info in unit_infos {
+        let CompileUnitInfo {
+            file_path,
+            program,
+            is_entry_unit,
+        } = unit_info;
+        let file = file_path.into();
+
+        let ast = Parser::new(&program, file).run()?;
+
+        let mut analyzer = SemanticAnalyzer::new(
+            file,
+            root_dir.to_path_buf(),
+            rust_path.map(Path::to_path_buf),
+        )?;
+        let mut ir = analyzer.analyze(
+            ast,
+            AnalyzeOptions {
+                no_autoload,
+                no_prelude,
+                is_entry_unit,
+            },
+        )?;
+        for lib in analyzer.take_additional_native_libs() {
+            if !additional_native_libs.contains(&lib) {
+                additional_native_libs.push(lib);
+            }
+        }
+        Monomorphizer::new().run(&mut ir)?;
+
+        let code_generator = CodeGenerator::new(cgcx)?;
+
+        let module = code_generator.codegen(ir)?;
+
+        compiled_modules.push(module);
+    }
+
+    let module = compiled_modules.pop().unwrap();
+
+    // Link modules
+    for other_module in compiled_modules {
+        module
+            .link_in_module(other_module)
+            .map_err(|e| anyhow!(e.to_string()))?;
+    }
+
+    Ok((module, additional_native_libs))
+}
+
+fn display_optimized_llvm_ir(opt_level: OptimizationLevel, module: &Module) -> anyhow::Result<()> {
+    let bitcode_path = emit_bitcode_to_tempfile(module)?;
+
+    let status = Command::new("opt")
+        .args([
+            "-S",
+            &format!("-O{}", opt_level as u32),
+            &bitcode_path.to_string_lossy(),
+        ])
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!("Failed to optimize using 'opt'")
+    }
+
+    Ok(())
+}
+
+fn optimize_with_opt(
+    opt_level: OptimizationLevel,
+    bitcode_path: &Path,
+) -> anyhow::Result<TempPath> {
+    let tempfile = NamedTempFile::new()?;
+
+    let temppath = tempfile.into_temp_path();
+
+    let status = Command::new("opt")
+        .args([
+            &format!("-O{}", opt_level as u32),
+            "-o",
+            &temppath.to_string_lossy(),
+            &bitcode_path.to_string_lossy(),
+        ])
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!("Failed to optimize using 'opt'")
+    }
+
+    Ok(temppath)
+}
+
+fn emit_optimized_object_file_to_tempfile(
+    opt_level: OptimizationLevel,
+    module: &Module,
+) -> anyhow::Result<TempPath> {
+    let bitcode_path = emit_bitcode_to_tempfile(module)?;
+
+    let optimized_bitcode_path = optimize_with_opt(opt_level, &bitcode_path)?;
+
+    emit_object_file_to_tempfile(&optimized_bitcode_path)
+}
+
+pub(crate) fn compile_and_output_obj(
+    unit_infos: Vec<CompileUnitInfo>,
+    option: CompileOption,
+) -> anyhow::Result<()> {
+    let context = Context::create();
+    let cgcx = CodegenCtx::new(&context, option.no_gc)?;
+
+    let root_dir = option.root_dir.unwrap_or(PathBuf::from("."));
+
+    let (module, _) = compile(
+        &cgcx,
+        unit_infos,
+        &root_dir,
+        option.rust_path.as_deref(),
+        option.no_autoload,
+        option.no_prelude,
+    )?;
+
+    // Emit
+    if option.display_llvm_ir {
+        display_optimized_llvm_ir(option.opt_level, &module)?;
+    } else {
+        let obj_path = emit_optimized_object_file_to_tempfile(option.opt_level, &module)?;
+
+        fs::rename(obj_path, option.output_file_path)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn compile_and_link(
+    unit_infos: Vec<CompileUnitInfo>,
+    option: CompileOption,
+) -> anyhow::Result<()> {
+    let context = Context::create();
+    let cgcx = CodegenCtx::new(&context, option.no_gc)?;
+
+    let root_dir = option.root_dir.unwrap_or(PathBuf::from("."));
+
+    let (module, mut generated_libs) = compile(
+        &cgcx,
+        unit_infos,
+        &root_dir,
+        option.rust_path.as_deref(),
+        option.no_autoload,
+        option.no_prelude,
+    )?;
+
+    if module.get_function("main").is_none() {
+        return Err(CodegenError::MainNotFound.into());
+    }
+
+    // Emit
+    if option.display_llvm_ir {
+        display_optimized_llvm_ir(option.opt_level, &module)?;
+    } else {
+        let obj_path = emit_optimized_object_file_to_tempfile(option.opt_level, &module)?;
+
+        for lib in &option.additional_libs {
+            if !generated_libs.contains(lib) {
+                generated_libs.push(lib.clone());
+            }
+        }
+
+        emit_exe_file(&obj_path, &option.output_file_path, &generated_libs)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) struct CompileOption {
+    opt_level: OptimizationLevel,
+    display_llvm_ir: bool,
+    output_file_path: PathBuf,
+    root_dir: Option<PathBuf>,
+    rust_path: Option<PathBuf>,
+    no_autoload: bool,
+    no_prelude: bool,
+    no_gc: bool,
+    additional_libs: Vec<PathBuf>,
+}
+
+fn main() -> anyhow::Result<()> {
+    use clap::Parser;
+
+    let args = Args::parse();
+
+    // Handle subcommands first
+    if let Some(command) = args.command {
+        match command {
+            Commands::New { project_name, rust } => {
+                create_new_project(project_name, rust)?;
+                return Ok(());
+            }
+            Commands::Build => {
+                build_project()?;
+                return Ok(());
+            }
+            Commands::Run { args } => {
+                run_project(args)?;
+                return Ok(());
+            }
+            Commands::Lsp { stdio: _ } => {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(kaede_lsp::run_stdio());
+                return Ok(());
+            }
+        }
+    }
+
+    let file_paths = args.files;
+
+    let option = CompileOption {
+        opt_level: to_inkwell_opt_level(args.opt_level),
+        display_llvm_ir: args.display_llvm_ir,
+        output_file_path: args.output.unwrap_or(PathBuf::from(if args.c {
+            "a.o"
+        } else {
+            "a.out"
+        })),
+        root_dir: args.root_dir,
+        // Direct-compile mode has no manifest to consult; preserve the
+        // legacy "rust/" lookup for `import rust::<crate>`.
+        rust_path: Some(PathBuf::from("rust")),
+        no_autoload: args.no_autoload,
+        no_prelude: args.no_prelude,
+        no_gc: args.no_gc,
+        additional_libs: Vec::new(),
+    };
+
+    if let Some(program) = args.program {
+        let mut unit_infos = vec![CompileUnitInfo {
+            file_path: PathBuf::from("<commandline>"),
+            program,
+            is_entry_unit: false,
+        }];
+        select_entry_unit(&mut unit_infos)?;
+        compile_and_link(unit_infos, option)?;
+
+        return Ok(());
+    }
+
+    if file_paths.is_empty() {
+        return Err(anyhow!("No input files"));
+    }
+
+    // --- Compile ---
+    let mut programs = Vec::new();
+
+    for file_path in file_paths {
+        programs.push(CompileUnitInfo {
+            program: fs::read_to_string(&file_path)
+                .with_context(|| format!("Failed to open file: {}", file_path.to_string_lossy()))?,
+            file_path,
+            is_entry_unit: false,
+        });
+    }
+
+    select_entry_unit(&mut programs)?;
+
+    if args.c {
+        // Emit object files
+        if let Err(err) = compile_and_output_obj(programs, option) {
+            // If backtrace is enabled, it is also displayed
+            eprintln!("{}: {:?}", "Error".bright_red(), err);
+            std::process::exit(1);
+        }
+    } else {
+        // Emit exe files
+        if let Err(err) = compile_and_link(programs, option) {
+            // If backtrace is enabled, it is also displayed
+            eprintln!("{}: {:?}", "Error".bright_red(), err);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}

@@ -1,0 +1,22 @@
+// This file is special; it is not treated as a module and is automatically loaded into the programs
+// And this is not included in the standard library and will not be compiled
+
+import std.collections
+import std.io
+import std.option
+import std.result
+import std.string
+import std.sync
+import std.ffi.args
+
+export use std.collections.Vector
+export use std.collections.HashMap
+export use std.option.Option
+export use std.result.Result
+export use std.string.String
+export use std.sync.Channel
+export use std.ffi.args.__prepare_command_line_arguments
+export use std.io.print
+export use std.io.println
+export use std.io.eprint
+export use std.io.eprintln

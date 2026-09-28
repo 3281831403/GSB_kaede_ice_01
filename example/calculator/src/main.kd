@@ -1,0 +1,27 @@
+import tokenize
+import eval
+import parse
+
+use tokenize.Tokenizer
+use parse.Parser
+use eval.Evaluator
+
+fun main(args: Vector<str>) -> i32 {
+    expr := String::from(match args.at(1) {
+        Option::Some(expr) => expr,
+
+        Option::None => {
+            println("Please provide an expression as an command line argument!")
+            return 1
+        }
+    })
+
+    tokenizer := Tokenizer::new()
+    tokens := tokenizer.tokenize(expr).unwrap()
+
+    mut parser := Parser::new()
+    ast := parser.parse(tokens)
+
+    evaluator := Evaluator::new()
+    return evaluator.eval(ast)
+}

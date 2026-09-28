@@ -1,0 +1,10 @@
+export extern "C" fun kaede_mem_alloc(size: u64) -> *u8
+export extern "C" fun kaede_mem_realloc(ptr: *u8, size: u64) -> *u8
+
+export fun __mem_alloc(size: u64) -> *u8 {
+    return kaede_mem_alloc(size)
+}
+
+export fun __mem_realloc(ptr: *u8, size: u64) -> *u8 {
+    return kaede_mem_realloc(ptr, size)
+}

@@ -1,0 +1,1228 @@
+use std::{
+    cell::RefCell,
+    fs::{self},
+    rc::Rc,
+};
+
+use crate::{context::AnalyzeCommand, rust_import, SemanticAnalyzer, SemanticError};
+use kaede_symbol_table::{
+    ConstValue, GenericBuiltinSliceInfo, GenericEnumInfo, GenericFuncInfo, GenericImplInfo,
+    GenericInfo, GenericKind, GenericStructInfo, ResolvedGenericParam, ResolvedGenericParams,
+    SymbolResolver, SymbolTable, SymbolTableValue, SymbolTableValueKind, VariableInfo,
+};
+
+use kaede_ast::{self as ast};
+use kaede_ast_type as ast_type;
+use kaede_common::kaede_lib_src_dir;
+use kaede_ir::{self as ir, module_path::ModulePath, qualified_symbol::QualifiedSymbol};
+use kaede_parse::Parser;
+use kaede_span::{file::FilePath, Span};
+use kaede_symbol::{Ident, Symbol};
+
+/// If a top-level is generic, there is no IR that can be generated immediately, so this enum is used.
+#[derive(Debug, Clone)]
+pub enum TopLevelAnalysisResult {
+    GenericTopLevel,
+    Imported(Vec<ir::top::TopLevel>),
+    TopLevel(ir::top::TopLevel),
+}
+
+impl SemanticAnalyzer {
+    fn infer_top_const_initializer(
+        &mut self,
+        init: &mut ir::expr::Expr,
+    ) -> anyhow::Result<Rc<ir::ty::Ty>> {
+        use kaede_type_infer::TypeInferrer;
+
+        let module = &self.modules[self.current_module_path()];
+        let resolver = SymbolResolver::merge_for_inference(
+            module.get_symbol_tables(),
+            self.build_qualified_symbol_table(),
+        );
+        let mut inferrer = TypeInferrer::new(
+            resolver,
+            Rc::new(ir::ty::Ty::new_unit()),
+            self.infer_context.type_var_allocator.clone(),
+        );
+
+        inferrer.infer_expr(init)?;
+        inferrer.apply_expr(init)?;
+        self.merge_generated_callable_substitutions(
+            inferrer.into_generated_callable_substitutions(),
+        );
+
+        Ok(init.ty.clone())
+    }
+
+    fn fn_decl_requires_delayed_inference(decl: &ir::top::FnDecl) -> bool {
+        Self::fn_decl_has_unresolved_types(decl)
+    }
+
+    pub fn analyze_top_level(
+        &mut self,
+        top_level: ast::top::TopLevel,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        use ast::top::TopLevelKind;
+
+        match top_level.kind {
+            TopLevelKind::Fn(node) => self.analyze_fn(node),
+            TopLevelKind::Struct(node) => self.analyze_struct(node),
+            TopLevelKind::Enum(node) => self.analyze_enum(node),
+            TopLevelKind::Impl(node) => self.analyze_impl(node),
+            TopLevelKind::Extern(node) => self.analyze_extern(node),
+            TopLevelKind::Import(node) => self.analyze_import(node),
+            TopLevelKind::Use(node) => self.analyze_use(node),
+            TopLevelKind::TypeAlias(node) => self.analyze_type_alias(node),
+            TopLevelKind::Interface(node) => self.analyze_interface(node),
+            TopLevelKind::Const(node) => self.analyze_top_const(node),
+        }
+    }
+
+    pub fn analyze_use(&mut self, node: ast::top::Use) -> anyhow::Result<TopLevelAnalysisResult> {
+        let modules = node.path.segments[..node.path.segments.len() - 1].to_vec();
+        let current_module_path = self.current_module_path().get_module_names_from_root();
+        let parent_module_path = if node.path.segments[0].is_std() {
+            vec![]
+        } else {
+            current_module_path[..current_module_path.len() - 1].to_vec()
+        };
+
+        let access_chain = parent_module_path
+            .into_iter()
+            .chain(modules.into_iter().map(|s| match s {
+                ast::top::PathSegment::Segment(ident) => ident.symbol(),
+                ast::top::PathSegment::Star => todo!(),
+            }))
+            .collect::<Vec<_>>();
+
+        let (_, path_to_use) =
+            self.create_module_path_from_access_chain(&access_chain, node.span)?;
+
+        let bind = |analyzer: &mut SemanticAnalyzer, name: Symbol| -> anyhow::Result<()> {
+            let symbol = analyzer
+                .lookup_qualified_symbol(QualifiedSymbol::new(path_to_use.clone(), name))
+                .ok_or(SemanticError::Undeclared {
+                    name,
+                    span: node.span,
+                })?;
+
+            let current_module_path = analyzer.current_module_path().clone();
+            // Respect the declared visibility: a bare `use` is module-local (private),
+            // while `export use` re-exports the name. Generic bodies that reference a
+            // private `use` binding still resolve it because monomorphization re-enters
+            // the defining module via `with_defining_module`/`with_module`, and the
+            // module's private table is visible to same-module lookups.
+            analyzer
+                .modules
+                .get_mut(&current_module_path)
+                .unwrap()
+                .bind_symbol(name, symbol, node.vis);
+
+            Ok(())
+        };
+
+        match node.path.segments.last().unwrap() {
+            ast::top::PathSegment::Segment(ident) => bind(self, ident.symbol())?,
+
+            // Use all symbols in the module
+            ast::top::PathSegment::Star => {
+                let symbols = self.modules[&path_to_use].get_all_symbols();
+
+                for symbol in symbols {
+                    bind(self, symbol)?;
+                }
+            }
+        }
+
+        Ok(TopLevelAnalysisResult::Imported(vec![]))
+    }
+
+    pub fn create_module_path_from_access_chain(
+        &self,
+        access_chain: &[Symbol],
+        span: Span,
+    ) -> anyhow::Result<(FilePath, ModulePath)> {
+        assert!(!access_chain.is_empty());
+
+        let path_prefix = if self
+            .current_module_path()
+            .get_module_names_from_root()
+            .is_empty()
+        {
+            // Root module
+            return Ok((FilePath::dummy(), ModulePath::new(Vec::from(access_chain))));
+        } else if access_chain.first().unwrap().as_str() == "std" {
+            // Standard library
+            kaede_lib_src_dir()
+        } else {
+            self.modules
+                .get(self.current_module_path())
+                .unwrap()
+                .file_path()
+                .path()
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        };
+
+        let mut path = path_prefix;
+
+        // Build the file path to be imported
+        for (idx, segment) in access_chain.iter().enumerate() {
+            if idx == access_chain.len() - 1 {
+                path = path.join(segment.as_str()).with_extension("kd");
+                break;
+            }
+
+            path = path.join(segment.as_str());
+        }
+
+        // Check if the file exists
+        if !path.exists() {
+            return Err(SemanticError::FileNotFoundForModule {
+                span,
+                file_path: path.to_string_lossy().to_string(),
+                mod_name: *access_chain.last().unwrap(),
+            }
+            .into());
+        }
+
+        let path = path.to_path_buf().into();
+
+        let module_path = Self::create_module_path_from_file_path(self.root_dir.clone(), path)?;
+
+        Ok((path, module_path))
+    }
+
+    pub fn analyze_import(
+        &mut self,
+        node: ast::top::Import,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        match node.kind {
+            ast::top::ImportKind::Kaede(module_path) => {
+                self.analyze_kaede_import(module_path, node.span)
+            }
+            ast::top::ImportKind::Foreign { lang, crate_name } => {
+                self.analyze_foreign_import(lang.symbol(), crate_name.symbol(), node.span)
+            }
+        }
+    }
+
+    fn analyze_kaede_import(
+        &mut self,
+        module_path_ast: ast::top::Path,
+        span: Span,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        let (path, module_path) = self.create_module_path_from_access_chain(
+            module_path_ast
+                .segments
+                .iter()
+                .map(|s| match s {
+                    ast::top::PathSegment::Segment(ident) => ident.symbol(),
+                    ast::top::PathSegment::Star => todo!(),
+                })
+                .collect::<Vec<_>>()
+                .as_slice(),
+            span,
+        )?;
+
+        // Prevent duplicate imports
+        if self.imported_module_paths.contains(&path.path()) {
+            return Ok(TopLevelAnalysisResult::Imported(vec![]));
+        } else {
+            self.imported_module_paths
+                .insert(path.path().canonicalize()?);
+        }
+
+        // Add the module to the module table
+        let module_context = Self::create_module_context(path);
+        self.modules.insert(module_path.clone(), module_context);
+
+        let mut parsed_module = Parser::new(&fs::read_to_string(path.path()).unwrap(), path)
+            .run()
+            .unwrap();
+
+        if !self.context.no_prelude()
+            && module_path
+                .get_module_names_from_root()
+                .first()
+                .unwrap()
+                .as_str()
+                != "std"
+        {
+            self.insert_prelude(&mut parsed_module)?;
+        }
+
+        let mut top_level_irs = vec![];
+
+        self.with_module(module_path.clone(), |analyzer| {
+            let mut results = vec![];
+            let mut top_levels = Vec::new();
+            let mut top_level_consts = Vec::new();
+            let mut explicit_main_span = None;
+
+            for item in parsed_module.items {
+                match item {
+                    ast::ModuleItem::Decl(top_level) => {
+                        if explicit_main_span.is_none() {
+                            explicit_main_span = Self::find_explicit_main_span(&top_level);
+                        }
+                        if matches!(top_level.kind, ast::top::TopLevelKind::Const(_)) {
+                            top_level_consts.push(top_level);
+                        } else {
+                            top_levels.push(top_level);
+                        }
+                    }
+                    ast::ModuleItem::Stmt(stmt) => {
+                        return Err(SemanticError::TopLevelStatementsOnlyAllowedInEntryUnit {
+                            span: stmt.span,
+                        }
+                        .into())
+                    }
+                }
+            }
+
+            // Imported Kaede modules are always analyzed as non-entry units.
+            if let Some(span) = explicit_main_span {
+                return Err(SemanticError::MainOnlyAllowedInEntryUnit { span }.into());
+            }
+
+            let (types, others): (Vec<_>, Vec<_>) = top_levels.into_iter().partition(|top| {
+                matches!(
+                    top.kind,
+                    ast::top::TopLevelKind::Struct(_)
+                        | ast::top::TopLevelKind::Enum(_)
+                        | ast::top::TopLevelKind::TypeAlias(_)
+                        | ast::top::TopLevelKind::Interface(_)
+                )
+            });
+
+            let (imports, others): (Vec<_>, Vec<_>) = others
+                .into_iter()
+                .partition(|top| matches!(top.kind, ast::top::TopLevelKind::Import(_)));
+
+            let (uses, others): (Vec<_>, Vec<_>) = others
+                .into_iter()
+                .partition(|top| matches!(top.kind, ast::top::TopLevelKind::Use(_)));
+
+            let (funcs, others): (Vec<_>, Vec<_>) = others.into_iter().partition(|top| {
+                matches!(
+                    top.kind,
+                    ast::top::TopLevelKind::Fn(_) | ast::top::TopLevelKind::Impl(_)
+                )
+            });
+
+            let others: Vec<_> = others
+                .into_iter()
+                .filter(|top| !matches!(top.kind, ast::top::TopLevelKind::Const(_)))
+                .collect();
+
+            // Analyze all imports.
+            for top_level in imports {
+                results.push(analyzer.analyze_top_level(top_level)?);
+            }
+
+            // Analyze all use directives.
+            for top_level in uses {
+                results.push(analyzer.analyze_top_level(top_level)?);
+            }
+
+            // Declare all types.
+            for top_level in types {
+                results.push(analyzer.analyze_top_level(top_level)?);
+            }
+
+            for top_level in top_level_consts {
+                results.push(analyzer.analyze_top_level(top_level)?);
+            }
+
+            // Declare all functions and methods.
+            // This removes the need to worry about function declaration order.
+            analyzer.with_analyze_command(AnalyzeCommand::OnlyFnDeclare, |analyzer| {
+                for top_level in funcs.iter() {
+                    match &top_level.kind {
+                        ast::top::TopLevelKind::Fn(function) => {
+                            results.push(analyzer.analyze_fn(function.clone())?);
+                        }
+
+                        ast::top::TopLevelKind::Impl(impl_block) => {
+                            results.push(analyzer.analyze_impl(impl_block.clone())?);
+                        }
+
+                        _ => {}
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+
+            // Analyze all remaining top levels after declarations are registered.
+            for top_level in others {
+                results.push(analyzer.analyze_top_level(top_level)?);
+            }
+
+            for result in results {
+                match result {
+                    TopLevelAnalysisResult::TopLevel(top_level) => top_level_irs.push(top_level),
+                    TopLevelAnalysisResult::Imported(imported_irs) => {
+                        top_level_irs.extend(imported_irs)
+                    }
+                    _ => continue,
+                }
+            }
+
+            // Note: the module's private symbol table is intentionally retained so that
+            // cross-module monomorphization of generic functions/methods can resolve
+            // private helpers referenced from their bodies.
+
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        Ok(TopLevelAnalysisResult::Imported(top_level_irs))
+    }
+
+    fn analyze_foreign_import(
+        &mut self,
+        lang: Symbol,
+        crate_name: Symbol,
+        span: Span,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        if lang.as_str() != "rust" {
+            return Err(SemanticError::UnsupportedLanguageLinkage {
+                lang_linkage: lang,
+                span,
+            }
+            .into());
+        }
+
+        if self.imported_rust_crates.contains(&crate_name) {
+            return Ok(TopLevelAnalysisResult::Imported(vec![]));
+        }
+        self.imported_rust_crates.insert(crate_name);
+
+        let Some(rust_path) = self.rust_path.as_deref() else {
+            return Err(anyhow::anyhow!(
+                "`import rust::{crate_name}` requires Rust interop to be enabled. Add a `[rust]` section to Kaede.toml."
+            ));
+        };
+        let resolved =
+            rust_import::resolve_rust_import(&self.root_dir, rust_path, crate_name.as_str())?;
+
+        if let Some(lib) = &resolved.dylib_path {
+            if !self.additional_native_libs.contains(lib) {
+                self.additional_native_libs.push(lib.clone());
+            }
+        }
+
+        let module_path = resolved.module_path.clone();
+        if !self.modules.contains_key(&module_path) {
+            let module_context = Self::create_module_context(FilePath::dummy());
+            self.modules.insert(module_path.clone(), module_context);
+        }
+
+        let mut imported_irs = Vec::new();
+        for skipped in resolved.skipped {
+            eprintln!(
+                "warning: skipped rust function in `{}`: {}",
+                crate_name, skipped
+            );
+        }
+
+        for func in resolved.functions {
+            let decl = ir::top::FnDecl {
+                lang_linkage: kaede_common::LangLinkage::C,
+                link_once: false,
+                name: QualifiedSymbol::new(module_path.clone(), func.export_name),
+                params: func
+                    .params
+                    .iter()
+                    .map(|(name, ty)| ir::top::Param {
+                        name: *name,
+                        ty: ty.clone(),
+                        default: None,
+                    })
+                    .collect(),
+                is_c_variadic: false,
+                return_ty: func.return_ty.clone(),
+                generic_instance: None,
+            };
+
+            let symbol_value = SymbolTableValue::new(
+                SymbolTableValueKind::Function(Rc::new(decl.clone())),
+                module_path.clone(),
+            );
+            self.modules
+                .get_mut(&module_path)
+                .unwrap()
+                .insert_symbol_to_root_scope(
+                    func.kaede_name,
+                    symbol_value,
+                    ast::top::Visibility::Public,
+                    span,
+                )?;
+
+            imported_irs.push(ir::top::TopLevel::Fn(Rc::new(ir::top::Fn {
+                decl,
+                body: None,
+            })));
+        }
+
+        Ok(TopLevelAnalysisResult::Imported(imported_irs))
+    }
+
+    pub fn analyze_extern(
+        &mut self,
+        node: ast::top::Extern,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        let mut fn_decl = self.analyze_fn_decl(node.fn_decl)?;
+
+        if let Some(lang_linkage) = node.lang_linkage {
+            fn_decl.lang_linkage = match lang_linkage.syb.as_str() {
+                "C" => kaede_common::LangLinkage::C,
+                _ => unreachable!(),
+            };
+        }
+
+        Ok(TopLevelAnalysisResult::TopLevel(ir::top::TopLevel::Fn(
+            Rc::new(ir::top::Fn {
+                decl: fn_decl,
+                body: None,
+            }),
+        )))
+    }
+
+    pub fn analyze_impl(&mut self, node: ast::top::Impl) -> anyhow::Result<TopLevelAnalysisResult> {
+        let span = node.span;
+
+        if let Some(_generic_params) = node.generic_params.as_ref() {
+            let resolved_generic_params =
+                self.resolve_generic_params(node.generic_params.as_ref())?;
+            let base_ty = if let ast_type::TyKind::Reference(rty) = node.ty.kind.as_ref() {
+                rty.get_base_type()
+            } else {
+                todo!("Error")
+            };
+
+            match base_ty.kind.as_ref() {
+                ast_type::TyKind::UserDefined(udt) => {
+                    let symbol_kind = self.lookup_symbol(udt.name.symbol()).ok_or_else(|| {
+                        SemanticError::Undeclared {
+                            name: udt.name.symbol(),
+                            span: node.span,
+                        }
+                    })?;
+
+                    match &mut symbol_kind.borrow_mut().kind {
+                        SymbolTableValueKind::Generic(ref mut generic_info) => {
+                            match &mut generic_info.kind {
+                                GenericKind::Struct(info) => {
+                                    info.impl_info = Some(GenericImplInfo::new(
+                                        node,
+                                        resolved_generic_params,
+                                        span,
+                                    ));
+                                }
+                                GenericKind::Enum(info) => {
+                                    info.impl_info = Some(GenericImplInfo::new(
+                                        node,
+                                        resolved_generic_params,
+                                        span,
+                                    ));
+                                }
+                                _ => todo!("Error"),
+                            }
+                        }
+
+                        _ => todo!("Error"),
+                    }
+
+                    // Generic impls are not created immediately, but are created when they are used.
+                    return Ok(TopLevelAnalysisResult::GenericTopLevel);
+                }
+
+                ast_type::TyKind::Slice(_) => {
+                    let defining_module = self.current_module_path().clone();
+                    let impl_info = GenericImplInfo::new(node, resolved_generic_params, span);
+                    let slice_symbol = Symbol::from("slice".to_owned());
+                    let root_module = self
+                        .modules
+                        .get_mut(&ModulePath::root())
+                        .expect("root module");
+
+                    if let Some(symbol) = root_module.lookup_symbol(&slice_symbol) {
+                        let mut borrowed = symbol.borrow_mut();
+                        match &mut borrowed.kind {
+                            SymbolTableValueKind::Generic(generic_info) => {
+                                match &mut generic_info.kind {
+                                    GenericKind::BuiltinSlice(info) => {
+                                        info.impl_info = impl_info;
+                                        info.defining_module = defining_module;
+                                    }
+                                    _ => todo!("Error"),
+                                }
+                            }
+                            _ => todo!("Error"),
+                        }
+                    } else {
+                        root_module.insert_symbol_to_root_scope(
+                            slice_symbol,
+                            SymbolTableValue::new(
+                                SymbolTableValueKind::Generic(Box::new(GenericInfo::new(
+                                    GenericKind::BuiltinSlice(GenericBuiltinSliceInfo {
+                                        impl_info,
+                                        defining_module,
+                                    }),
+                                    ModulePath::root(),
+                                ))),
+                                ModulePath::root(),
+                            ),
+                            ast::top::Visibility::Private,
+                            span,
+                        )?;
+                    }
+
+                    return Ok(TopLevelAnalysisResult::GenericTopLevel);
+                }
+
+                _ => todo!("Error"),
+            }
+        }
+
+        let mut methods = vec![];
+
+        let ast_ty = Rc::new(node.ty);
+
+        for item in node.items.iter() {
+            match &item.kind {
+                ast::top::TopLevelKind::Fn(fn_) => {
+                    if let Some(method) = self.analyze_method(ast_ty.clone(), fn_.clone())? {
+                        methods.push(method);
+                    }
+                }
+                _ => todo!("Error"),
+            }
+        }
+
+        Ok(TopLevelAnalysisResult::TopLevel(ir::top::TopLevel::Impl(
+            Rc::new(ir::top::Impl { methods }),
+        )))
+    }
+
+    // Returns `None` for generic methods: their IR is materialized lazily at each
+    // monomorphization call site, so there's nothing to add to the enclosing `impl` now.
+    // Non-generic methods return `Some(Fn)`.
+    fn analyze_method(
+        &mut self,
+        ty: Rc<ast_type::Ty>,
+        mut node: ast::top::Fn,
+    ) -> anyhow::Result<Option<Rc<ir::top::Fn>>> {
+        // If the method isn't static, insert self to the front of the parameters
+        if let Some(mutability) = node.decl.self_ {
+            node.decl.params.v.insert(
+                0,
+                ast::top::Param {
+                    name: Ident::new("self".to_owned().into(), node.span),
+                    ty: ast_type::change_mutability_dup(ty.clone(), mutability),
+                    default: None,
+                },
+            );
+        }
+
+        let parent_ty = self.analyze_type(&ty)?;
+
+        // Built-in types (fundamentals, slices) have no defining module, so their methods
+        // live in the root module, reachable from anywhere by direct qualified lookup.
+        let (parent_name, should_route_to_root_module) = match parent_ty.kind.as_ref() {
+            ir::ty::TyKind::Reference(ty) => {
+                let base_ty = ty.get_base_type();
+                match base_ty.kind.as_ref() {
+                    ir::ty::TyKind::UserDefined(udt) => (udt.name(), false),
+                    ir::ty::TyKind::Slice(elem_ty) => (
+                        self.impl_method_parent_name(
+                            &Self::slice_generic_origin(),
+                            std::slice::from_ref(elem_ty),
+                        ),
+                        true,
+                    ),
+                    _ => (Symbol::from(base_ty.kind.to_string()), true),
+                }
+            }
+
+            ir::ty::TyKind::Fundamental(fty) => (Symbol::from(fty.kind.to_string()), true),
+            ir::ty::TyKind::Slice(elem_ty) => (
+                self.impl_method_parent_name(
+                    &Self::slice_generic_origin(),
+                    std::slice::from_ref(elem_ty),
+                ),
+                true,
+            ),
+
+            _ => unreachable!(),
+        };
+
+        node.decl.name = Ident::new(
+            self.create_method_key(
+                parent_name,
+                node.decl.name.symbol(),
+                node.decl.self_.is_none(),
+            ),
+            node.decl.name.span(),
+        );
+
+        node.decl.self_ = None;
+
+        if node.decl.generic_params.is_some() {
+            return self
+                .analyze_generic_method(node, should_route_to_root_module)
+                .map(|()| None);
+        }
+
+        if should_route_to_root_module {
+            let source_module_path = self.current_module_path().clone();
+            self.with_root_module_and_fallback(source_module_path, |analyzer| {
+                analyzer.analyze_fn_internal(node)
+            })
+            .map(Some)
+        } else {
+            self.analyze_fn_internal(node).map(Some)
+        }
+    }
+
+    fn analyze_generic_method(
+        &mut self,
+        node: ast::top::Fn,
+        should_route_to_root_module: bool,
+    ) -> anyhow::Result<()> {
+        // Body-analysis pass is a no-op for generic methods; they are
+        // monomorphized on demand at each call site.
+        if matches!(
+            self.context.analyze_command(),
+            AnalyzeCommand::WithoutFnDeclare
+        ) {
+            return Ok(());
+        }
+
+        let span = node.span;
+        let vis = node.decl.vis;
+        let name = node.decl.name.symbol();
+        let resolved_generic_params =
+            self.resolve_generic_params(node.decl.generic_params.as_ref())?;
+
+        if should_route_to_root_module {
+            let source_module_path = self.current_module_path().clone();
+            self.with_root_module_and_fallback(source_module_path, |analyzer| {
+                analyzer.register_generic_method_symbol(
+                    name,
+                    node,
+                    resolved_generic_params,
+                    vis,
+                    span,
+                )
+            })
+        } else {
+            self.register_generic_method_symbol(name, node, resolved_generic_params, vis, span)
+        }
+    }
+
+    fn register_generic_method_symbol(
+        &mut self,
+        name: Symbol,
+        node: ast::top::Fn,
+        resolved_generic_params: Option<ResolvedGenericParams>,
+        vis: ast::top::Visibility,
+        span: Span,
+    ) -> anyhow::Result<()> {
+        let module_path = self.current_module_path().clone();
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::Generic(
+                GenericInfo::new(
+                    GenericKind::Func(GenericFuncInfo {
+                        ast: node,
+                        resolved_generic_params,
+                    }),
+                    module_path.clone(),
+                )
+                .into(),
+            ),
+            module_path,
+        );
+        self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)
+    }
+
+    pub fn analyze_fn(&mut self, node: ast::top::Fn) -> anyhow::Result<TopLevelAnalysisResult> {
+        assert_eq!(node.decl.self_, None);
+
+        let vis = node.decl.vis;
+        let name = node.decl.name.symbol();
+
+        // If the function is generic, register it in the symbol table and return early.
+        if node.decl.generic_params.is_some() {
+            if matches!(
+                self.context.analyze_command(),
+                AnalyzeCommand::WithoutFnDeclare
+            ) {
+                return Ok(TopLevelAnalysisResult::GenericTopLevel);
+            }
+
+            let span = node.span;
+            let resolved_generic_params =
+                self.resolve_generic_params(node.decl.generic_params.as_ref())?;
+
+            let symbol_table_value = SymbolTableValue::new(
+                SymbolTableValueKind::Generic(
+                    GenericInfo::new(
+                        GenericKind::Func(GenericFuncInfo {
+                            ast: node,
+                            resolved_generic_params,
+                        }),
+                        self.current_module_path().clone(),
+                    )
+                    .into(),
+                ),
+                self.current_module_path().clone(),
+            );
+
+            self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)?;
+
+            // Generic functions are not generated immediately, but are generated when they are used.
+            return Ok(TopLevelAnalysisResult::GenericTopLevel);
+        }
+
+        Ok(TopLevelAnalysisResult::TopLevel(ir::top::TopLevel::Fn(
+            self.analyze_fn_internal(node)?,
+        )))
+    }
+
+    pub fn analyze_fn_internal(&mut self, node: ast::top::Fn) -> anyhow::Result<Rc<ir::top::Fn>> {
+        assert_eq!(node.decl.self_, None);
+
+        let fn_decl = if let AnalyzeCommand::WithoutFnDeclare = self.context.analyze_command() {
+            // Lookup the function declaration from the symbol table
+            let symbol_table_value =
+                self.lookup_symbol(node.decl.name.symbol())
+                    .ok_or(SemanticError::Undeclared {
+                        name: node.decl.name.symbol(),
+                        span: node.span,
+                    })?;
+
+            let borrowed = symbol_table_value.borrow();
+            match &borrowed.kind {
+                SymbolTableValueKind::Function(fn_decl) => fn_decl.as_ref().clone(),
+                _ => unreachable!(),
+            }
+        } else {
+            self.analyze_fn_decl(node.decl)?
+        };
+
+        if matches!(
+            self.context.analyze_command(),
+            AnalyzeCommand::OnlyFnDeclare
+        ) {
+            return Ok(Rc::new(ir::top::Fn {
+                decl: fn_decl,
+                body: None,
+            }));
+        }
+
+        self.context.set_current_function(Rc::new(fn_decl.clone()));
+
+        // Create a new symbol table for the function parameters.
+        {
+            let mut symbol_table = SymbolTable::new();
+            for param in fn_decl.params.iter() {
+                let symbol_table_value = SymbolTableValue::new(
+                    SymbolTableValueKind::Variable(VariableInfo::new(param.ty.clone())),
+                    self.current_module_path().clone(),
+                );
+
+                symbol_table.insert(
+                    param.name,
+                    Rc::new(RefCell::new(symbol_table_value)),
+                    node.span,
+                )?;
+            }
+            self.push_scope(symbol_table);
+        }
+
+        let mut fn_body = self.analyze_block(&node.body)?;
+
+        // Delay inference for generated generic functions that still carry unresolved
+        // type variables in their signatures. These are resolved from call-site
+        // constraints later in type inference.
+        if !Self::fn_decl_requires_delayed_inference(&fn_decl) {
+            self.infer_function_body_inline(&mut fn_body, &fn_decl)?;
+        }
+
+        let fn_ = Rc::new(ir::top::Fn {
+            decl: fn_decl,
+            body: Some(fn_body),
+        });
+
+        // Pop the function symbol table.
+        self.pop_scope();
+
+        self.context.pop_current_function();
+
+        Ok(fn_)
+    }
+
+    fn analyze_fn_decl(&mut self, node: ast::top::FnDecl) -> anyhow::Result<ir::top::FnDecl> {
+        let name = node.name.symbol();
+
+        let qualified_name = if name.as_str() == "main" {
+            QualifiedSymbol::new(ModulePath::root(), "kdmain".to_owned().into())
+        } else {
+            QualifiedSymbol::new(self.current_module_path().clone(), name)
+        };
+
+        let params = node
+            .params
+            .v
+            .into_iter()
+            .map(|p| -> anyhow::Result<ir::top::Param> {
+                let ty = self.analyze_type(&p.ty)?;
+                let default = if let Some(default) = p.default {
+                    let analyzed_default =
+                        self.analyze_expr_with_expected_type(default.as_ref(), ty.clone())?;
+
+                    if !ir::ty::is_same_type(&ty, &analyzed_default.ty) {
+                        return Err(SemanticError::MismatchedTypes {
+                            types: (format!("{ty:?}"), format!("{:?}", analyzed_default.ty)),
+                            span: analyzed_default.span,
+                        }
+                        .into());
+                    }
+
+                    Some(Rc::new(analyzed_default))
+                } else {
+                    None
+                };
+
+                Ok(ir::top::Param {
+                    name: p.name.symbol(),
+                    ty,
+                    default,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let fn_decl = ir::top::FnDecl {
+            lang_linkage: node.lang_linkage,
+            link_once: node.link_once,
+            name: qualified_name,
+            is_c_variadic: matches!(node.params.variadic, ast::top::VariadicKind::C),
+            params,
+            return_ty: self.analyze_type(&node.return_ty)?,
+            generic_instance: self.pending_generic_instance(),
+        };
+
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::Function(Rc::new(fn_decl.clone())),
+            self.current_module_path().clone(),
+        );
+
+        self.insert_symbol_to_root_scope(name, symbol_table_value, node.vis, node.span)?;
+
+        Ok(fn_decl)
+    }
+
+    pub fn analyze_struct(
+        &mut self,
+        node: ast::top::Struct,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        let vis = node.vis;
+        let name = node.name.symbol();
+        let span = node.span;
+
+        // For generic
+        if node.generic_params.is_some() {
+            let resolved_generic_params =
+                self.resolve_generic_params(node.generic_params.as_ref())?;
+            let symbol_table_value = SymbolTableValue::new(
+                SymbolTableValueKind::Generic(
+                    GenericInfo::new(
+                        GenericKind::Struct(GenericStructInfo::new(node, resolved_generic_params)),
+                        self.current_module_path().clone(),
+                    )
+                    .into(),
+                ),
+                self.current_module_path().clone(),
+            );
+
+            self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)?;
+
+            // Generic structs are not created immediately, but are created when they are used.
+            return Ok(TopLevelAnalysisResult::GenericTopLevel);
+        }
+
+        let qualified_name = QualifiedSymbol::new(self.current_module_path().clone(), name);
+
+        // This placeholder allows recursive struct definitions
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::Placeholder(qualified_name.clone()),
+            self.current_module_path().clone(),
+        );
+        self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)?;
+
+        let fields = node
+            .fields
+            .into_iter()
+            .map(|field| -> anyhow::Result<ir::top::StructField> {
+                Ok(ir::top::StructField {
+                    name: field.name.symbol(),
+                    ty: self.analyze_type(&field.ty)?,
+                    offset: field.offset,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let ir = Rc::new(ir::top::Struct {
+            name: qualified_name,
+            fields,
+            generic_instance: self.pending_generic_instance(),
+        });
+
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::Struct(ir.clone()),
+            self.current_module_path().clone(),
+        );
+
+        self.insert_symbol_to_root_scope(name, symbol_table_value, node.vis, span)?;
+
+        Ok(TopLevelAnalysisResult::TopLevel(ir::top::TopLevel::Struct(
+            ir,
+        )))
+    }
+
+    pub fn analyze_enum(&mut self, node: ast::top::Enum) -> anyhow::Result<TopLevelAnalysisResult> {
+        let vis = node.vis;
+        let name = node.name.symbol();
+        let span = node.span;
+
+        // For generic
+        if node.generic_params.is_some() {
+            let resolved_generic_params =
+                self.resolve_generic_params(node.generic_params.as_ref())?;
+            let symbol_table_value = SymbolTableValue::new(
+                SymbolTableValueKind::Generic(
+                    GenericInfo::new(
+                        GenericKind::Enum(GenericEnumInfo::new(node, resolved_generic_params)),
+                        self.current_module_path().clone(),
+                    )
+                    .into(),
+                ),
+                self.current_module_path().clone(),
+            );
+
+            self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)?;
+
+            // Generics are not created immediately, but are created when they are used.
+            return Ok(TopLevelAnalysisResult::GenericTopLevel);
+        }
+
+        let qualified_name = QualifiedSymbol::new(self.current_module_path().clone(), name);
+
+        // This placeholder allows recursive enum definitions
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::Placeholder(qualified_name.clone()),
+            self.current_module_path().clone(),
+        );
+        self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)?;
+
+        let variants = node
+            .variants
+            .into_iter()
+            .map(|variant| -> anyhow::Result<ir::top::EnumVariant> {
+                Ok(ir::top::EnumVariant {
+                    name: variant.name.symbol(),
+                    ty: match variant.ty {
+                        None => None,
+                        Some(ty) => Some(self.analyze_type(&ty)?),
+                    },
+                    offset: variant.offset,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let ir = Rc::new(ir::top::Enum {
+            name: qualified_name,
+            variants,
+            generic_instance: self.pending_generic_instance(),
+        });
+
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::Enum(ir.clone()),
+            self.current_module_path().clone(),
+        );
+
+        self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)?;
+
+        Ok(TopLevelAnalysisResult::TopLevel(ir::top::TopLevel::Enum(
+            ir,
+        )))
+    }
+
+    pub fn analyze_interface(
+        &mut self,
+        node: ast::top::Interface,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        let vis = node.vis;
+        let name = node.name.symbol();
+        let span = node.span;
+
+        let qualified_name = QualifiedSymbol::new(self.current_module_path().clone(), name);
+
+        // Insert a placeholder so interface methods may reference the
+        // interface itself in their parameter / return types.
+        let placeholder_value = SymbolTableValue::new(
+            SymbolTableValueKind::Placeholder(qualified_name.clone()),
+            self.current_module_path().clone(),
+        );
+        self.insert_symbol_to_root_scope(name, placeholder_value, vis, span)?;
+
+        let mut methods = Vec::with_capacity(node.methods.len());
+        for method in node.methods {
+            let params = method
+                .params
+                .v
+                .into_iter()
+                .map(|p| -> anyhow::Result<ir::top::Param> {
+                    Ok(ir::top::Param {
+                        name: p.name.symbol(),
+                        ty: self.analyze_type(&p.ty)?,
+                        default: None,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            let return_ty = self.analyze_type(&method.return_ty)?;
+
+            methods.push(ir::top::InterfaceMethod {
+                name: method.name.symbol(),
+                self_: method.self_.map(ir::ty::Mutability::from),
+                params,
+                return_ty,
+            });
+        }
+
+        let ir = Rc::new(ir::top::Interface {
+            name: qualified_name,
+            methods,
+        });
+
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::Interface(ir.clone()),
+            self.current_module_path().clone(),
+        );
+
+        self.insert_symbol_to_root_scope(name, symbol_table_value, vis, span)?;
+
+        Ok(TopLevelAnalysisResult::TopLevel(
+            ir::top::TopLevel::Interface(ir),
+        ))
+    }
+
+    pub fn analyze_top_const(
+        &mut self,
+        node: ast::top::TopConst,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        if !self.is_const_initializer(&node.init) {
+            return Err(SemanticError::ConstInitializerNotConst {
+                span: node.init.span,
+            }
+            .into());
+        }
+
+        let const_ty = if node.ty.kind.is_inferred() {
+            let mut init = self.analyze_expr(&node.init)?;
+            let inferred = self.infer_top_const_initializer(&mut init)?;
+            ir::ty::change_mutability_dup(inferred, ir::ty::Mutability::Not)
+        } else {
+            let annotated = self.analyze_type(&node.ty)?;
+            let _init = self.analyze_expr_with_expected_type(&node.init, annotated.clone())?;
+            ir::ty::change_mutability_dup(annotated, ir::ty::Mutability::Not)
+        };
+        let const_value = self
+            .evaluate_integer_const_expr(&node.init)
+            .map(ConstValue::Integer);
+
+        self.insert_symbol_to_root_scope(
+            node.name.symbol(),
+            SymbolTableValue::new(
+                SymbolTableValueKind::Variable(VariableInfo::new_const(const_ty, const_value)),
+                self.current_module_path().clone(),
+            ),
+            node.vis,
+            node.span,
+        )?;
+
+        Ok(TopLevelAnalysisResult::Imported(vec![]))
+    }
+
+    pub fn analyze_type_alias(
+        &mut self,
+        node: ast::top::TypeAlias,
+    ) -> anyhow::Result<TopLevelAnalysisResult> {
+        let name = node.name.symbol();
+        let span = node.span;
+
+        let resolved_ty = self.analyze_type(&node.aliased_type)?;
+
+        let symbol_table_value = SymbolTableValue::new(
+            SymbolTableValueKind::TypeAlias(resolved_ty),
+            self.current_module_path().clone(),
+        );
+
+        self.insert_symbol_to_root_scope(name, symbol_table_value, node.vis, span)?;
+
+        Ok(TopLevelAnalysisResult::Imported(vec![]))
+    }
+    fn resolve_generic_params(
+        &self,
+        params: Option<&ast::top::GenericParams>,
+    ) -> anyhow::Result<Option<ResolvedGenericParams>> {
+        let Some(params) = params else {
+            return Ok(None);
+        };
+
+        let resolved_params = params
+            .params
+            .iter()
+            .map(|param| -> anyhow::Result<ResolvedGenericParam> {
+                let bound = match param.bound {
+                    Some(bound) => Some(self.resolve_generic_bound(bound)?),
+                    None => None,
+                };
+
+                Ok(ResolvedGenericParam {
+                    name: param.name.symbol(),
+                    bound,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(Some(ResolvedGenericParams {
+            params: resolved_params,
+            span: params.span,
+        }))
+    }
+
+    fn resolve_generic_bound(&self, bound: Ident) -> anyhow::Result<QualifiedSymbol> {
+        let symbol = self
+            .lookup_symbol(bound.symbol())
+            .ok_or(SemanticError::Undeclared {
+                name: bound.symbol(),
+                span: bound.span(),
+            })?;
+
+        let borrowed = symbol.borrow();
+
+        match &borrowed.kind {
+            SymbolTableValueKind::Interface(interface) => Ok(interface.name.clone()),
+            _ => Err(SemanticError::GenericBoundMustBeInterface {
+                name: bound.symbol(),
+                span: bound.span(),
+            }
+            .into()),
+        }
+    }
+}

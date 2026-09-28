@@ -1,0 +1,9 @@
+impl str {
+    export fun as_ptr(self) -> *u8 {
+        return self.0
+    }
+
+    export fun len(self) -> u64 {
+        return self.1
+    }
+}

@@ -1,0 +1,993 @@
+mod common;
+
+use std::collections::HashSet;
+
+use common::{semantic_analyze, semantic_analyze_expect_error, semantic_analyze_no_autoload};
+use kaede_ir::{expr::ExprKind as IrExprKind, stmt::Stmt, top::TopLevel, ty::TyKind as IrTyKind};
+use kaede_symbol::Symbol;
+
+#[test]
+fn int() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { 1 }")?;
+    Ok(())
+}
+
+#[test]
+fn array_literal() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { [1, 2, 3] }")?;
+    Ok(())
+}
+
+#[test]
+fn boolean_literal() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { true }")?;
+    semantic_analyze("fun f() { false }")?;
+    Ok(())
+}
+
+#[test]
+fn block() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { { 1 } }")?;
+    Ok(())
+}
+
+#[test]
+fn string_literal() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { \"hello\" }")?;
+    Ok(())
+}
+
+#[test]
+fn builtin_format() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { __format(\"hello {}\", \"world\") }")?;
+    Ok(())
+}
+
+#[test]
+fn builtin_format_requires_literal_template() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        "fun f() {
+            let t = \"hello {}\"
+            __format(t, \"world\")
+        }",
+    )?;
+    assert!(err
+        .to_string()
+        .contains("template must be a string literal"));
+    Ok(())
+}
+
+#[test]
+fn builtin_format_rejects_type_without_to_string() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        "struct P { a: i32 }\nfun f() { let p = P { a: 1 }\n__format(\"{}\", p) }",
+    )?;
+    assert!(err.to_string().contains("no method named `to_string`"));
+    Ok(())
+}
+
+#[test]
+fn builtin_format_requires_matching_placeholder_count() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error("fun f() { __format(\"{} {}\", \"x\") }")?;
+    assert!(err.to_string().contains("placeholder count mismatch"));
+    Ok(())
+}
+
+#[test]
+fn format_is_undeclared() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error("fun f() { format(\"{}\", \"x\") }")?;
+    assert!(err.to_string().contains("`format` was not declared"));
+    Ok(())
+}
+
+#[test]
+fn interpolated_string() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { let name = \"kaede\"; $\"hello {name}\" }")?;
+    Ok(())
+}
+
+#[test]
+fn arithmetic_binary() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { 1 + 2 }")?;
+    semantic_analyze("fun f() { 1 - 2 }")?;
+    semantic_analyze("fun f() { 1 * 2 }")?;
+    semantic_analyze("fun f() { 1 / 2 }")?;
+    semantic_analyze("fun f() { 1 % 2 }")?;
+    semantic_analyze("fun f() { 1 & 2 }")?;
+    semantic_analyze("fun f() { 1 | 2 }")?;
+    semantic_analyze("fun f() { 1 ^ 2 }")?;
+    semantic_analyze("fun f() { 1 << 2 }")?;
+    semantic_analyze("fun f() { 8 >> 1 }")?;
+    semantic_analyze("fun f() { 1 < 2 }")?;
+    semantic_analyze("fun f() { 1 <= 2 }")?;
+    semantic_analyze("fun f() { 1 > 2 }")?;
+    semantic_analyze("fun f() { 1 >= 2 }")?;
+    semantic_analyze("fun f() { 1 == 2 }")?;
+    semantic_analyze("fun f() { 1 != 2 }")?;
+    Ok(())
+}
+
+#[test]
+fn logical_binary() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { true && false }")?;
+    semantic_analyze("fun f() { true || false }")?;
+    Ok(())
+}
+
+#[test]
+fn logical_not() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { !true }")?;
+    Ok(())
+}
+
+#[test]
+fn bit_not() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { ~1 }")?;
+    Ok(())
+}
+
+#[test]
+fn channel_send_and_recv_syntax() -> anyhow::Result<()> {
+    semantic_analyze(
+        r#"import std.sync
+import std.option
+
+use std.sync.Channel
+use std.option.Option
+
+fun f() -> i32 {
+    let ch = Channel<i32>::with_capacity(1)
+    ch <- 42
+
+    return match <-ch {
+        Option::Some(v) => v,
+        Option::None => 0,
+    }
+}"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn lazy_impl_method_body_retain_in_main() -> anyhow::Result<()> {
+    semantic_analyze(
+        r#"import std.collections.vector
+import std.sync
+
+use std.collections.vector.Vector
+use std.sync.Channel
+
+struct Subscriber {
+    events: Channel<i32>,
+}
+
+fun main() {
+    let mut subscribers = Vector<Subscriber>::new()
+    subscribers.retain(|_s| true)
+}"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn lazy_impl_method_body_retain_in_http_handler_closure() -> anyhow::Result<()> {
+    semantic_analyze(
+        r#"import std.collections.vector
+import std.net.http
+import std.sync
+
+use std.collections.vector.Vector
+use std.sync.Channel
+
+struct Subscriber {
+    events: Channel<i32>,
+}
+
+fun main() {
+    mut app := std.net.http.App::new()
+    app.post("/x", |req, res| {
+        let mut subscribers = Vector<Subscriber>::new()
+        subscribers.retain(|_s| true)
+    })
+}"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn option_try_is_accepted() -> anyhow::Result<()> {
+    semantic_analyze(
+        r#"import std.option
+use std.option.Option
+
+fun inner() -> Option<i32> {
+    return Option::Some(42)
+}
+
+fun outer() -> Option<i32> {
+    value := inner()?;
+    return Option::Some(value)
+}"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn option_try_requires_option_operand() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        r#"import std.option
+use std.option.Option
+
+fun fail() -> Option<i32> {
+    value := 1?;
+    return Option::Some(value)
+}"#,
+    )?;
+    assert!(err.to_string().contains("`?` requires `Option<T>`"));
+    Ok(())
+}
+
+#[test]
+fn option_try_requires_option_function() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        r#"import std.option
+use std.option.Option
+
+fun fail() -> i32 {
+    value := Option::Some(1)?;
+    return value
+}"#,
+    )?;
+    assert!(err
+        .to_string()
+        .contains("`?` can only be used in functions returning `Option<T>`"));
+    Ok(())
+}
+
+#[test]
+fn channel_recv_requires_channel() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error("fun f() { <-1 }")?;
+    assert!(err.to_string().contains("channel receive requires"));
+    Ok(())
+}
+
+#[test]
+fn channel_send_requires_channel() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error("fun f() { 1 <- 2 }")?;
+    assert!(err.to_string().contains("channel send requires"));
+    Ok(())
+}
+
+#[test]
+fn array_indexing() -> anyhow::Result<()> {
+    semantic_analyze("fun f() { [0, 1, 2][1] }")?;
+    Ok(())
+}
+
+#[test]
+fn slice_type_annotation() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun len(s: [i32]) {
+            let _ = s[0]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn array_to_slice_param() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun take(s: [i32]) { let _ = s[1]; }
+        fun main() {
+            take([1, 2, 3])
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn array_to_slice_return() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun make() -> [i32] { [10, 20, 30] }
+        fun use_slice() {
+            let s = make()
+            let _ = s[2]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn array_to_slice_var() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun take(s: [i32]) -> i32 { return s[1] }
+
+        fun f() -> i32 {
+            let a: [i32; 3] = [1, 2, 3]
+            return take(a)
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn slice_full_range() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f() {
+            let ar = [0, 1, 2]
+            let _ = ar[:]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn slice_from_start() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f() {
+            let ar = [0, 1, 2, 3, 4]
+            let _ = ar[:3]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn slice_to_end() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f() {
+            let ar = [0, 1, 2, 3, 4]
+            let _ = ar[2:]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn slice_range() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f() {
+            let ar = [0, 1, 2, 3, 4]
+            let _ = ar[1:4]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn slice_of_slice() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f(s: [i32]) {
+            let mid = s[1:4]
+            let tail = mid[1:]
+            let _ = tail[0]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn slice_type_inference() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f() -> [i32] {
+            let ar = [1, 2, 3, 4]
+            return ar[1:]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn slice_bounds_error() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "fun f() {
+            let _ = true[:]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn function_call() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f(a: i32, b: i32) -> i32 { return a + b }\n
+        fun g() -> i32 { return f(48, 10) }
+    ",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn if_() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f(a: i32) -> i32 {
+            return if a == 0 {
+                1
+            } else if a > 0 {
+                -1
+            } else {
+                0
+            }
+        }",
+    )?;
+
+    // Test that `a < 0` is correctly parsed as a comparison, not generic syntax
+    semantic_analyze(
+        "fun f(a: i32) -> i32 {
+            return if a == 0 {
+                1
+            } else if a < 0 {
+                -1
+            } else {
+                0
+            }
+        }",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn tuple_literal() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f() -> (i32, bool) {
+            return (42, true)
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn tuple_indexing() -> anyhow::Result<()> {
+    semantic_analyze(
+        r#"fun f() -> i32 {
+            let t = (42, true, "hello, world")
+            return t.0
+        }"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn struct_literal() -> anyhow::Result<()> {
+    semantic_analyze(
+        "struct Foo { a: i32, b: bool }
+        fun f() -> Foo {
+            return Foo { a: 42, b: true }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn struct_literal_field_init_shorthand() -> anyhow::Result<()> {
+    semantic_analyze(
+        "struct Foo { a: i32, b: bool }
+        fun f() -> Foo {
+            let a = 42
+            let b = true
+            return Foo { a, b }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn struct_access() -> anyhow::Result<()> {
+    semantic_analyze(
+        "struct Foo { a: i32 }
+        fun f() -> i32 {
+            let a = Foo { a: 58 }
+            return a.a
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn loop_and_break() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f() {
+            loop {
+                break
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_on_bool() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f(x: bool) -> i32 {
+            return match x {
+                true => 1,
+                false => 0,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_on_int() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f(x: i32) -> i32 {
+            return match x {
+                0 => 1,
+                1 => 2,
+                _ => 0,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_on_enum() -> anyhow::Result<()> {
+    semantic_analyze(
+        "enum Foo { A, B, C }
+        fun f(x: Foo) -> i32 {
+            return match x {
+                Foo::A => 1,
+                Foo::B => 2,
+                Foo::C => 3,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_with_catch_all() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun f(x: i32) -> i32 {
+            return match x {
+                0 => 1,
+                _ => 0,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_not_exhaustive_enum() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "enum Foo { A, B, C }
+        fun f(x: Foo) -> i32 {
+            return match x {
+                Foo::A => 1,
+                Foo::B => 2,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_not_exhaustive_int() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "fun f(x: i32) -> i32 {
+            return match x {
+                0 => 1,
+                1 => 0,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_not_exhaustive_bool() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "fun f(x: bool) -> i32 {
+            return match x {
+                true => 1,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn enum_variant() -> anyhow::Result<()> {
+    semantic_analyze(
+        "enum Foo { A, B(i32), C }
+        fun f() -> i32 {
+            let x = Foo::B(1)
+            return match x {
+                Foo::A => 1,
+                Foo::B(y) => y,
+                Foo::C => 3,
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_catch_all_only_int_error() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "fun f() -> i32 {
+            let x = 42
+            return match x {
+                _ => 1
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_catch_all_only_enum_error() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "enum Foo { A, B }
+        fun f() -> i32 {
+            let x = Foo::A
+            return match x {
+                _ => 1
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_catch_all_undefined_function_int_error() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "fun f() -> i32 {
+            let x = 42
+            return match x {
+                1 => 10,
+                2 => 20,
+                _ => g()  // g() is undefined
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn match_catch_all_undefined_function_enum_error() -> anyhow::Result<()> {
+    semantic_analyze_expect_error(
+        "enum Foo { A, B }
+        fun f() -> i32 {
+            let x = Foo::A
+            return match x {
+                Foo::A => 10,
+                _ => g()  // g() is undefined
+            }
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn field_access_and_indexing() -> anyhow::Result<()> {
+    // Test that field access with indexing works correctly
+    semantic_analyze(
+        "struct Container { data: [i32; 3] }
+        fun f() -> i32 {
+            let c = Container { data: [1, 2, 3] }
+            return c.data[0]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn indexing_and_field_access() -> anyhow::Result<()> {
+    // Test that indexing followed by field access works correctly
+    semantic_analyze(
+        "struct Item { value: i32 }
+        fun f() -> i32 {
+            let item1 = Item { value: 10 }
+            let item2 = Item { value: 20 }
+            let item3 = Item { value: 30 }
+            let items: [Item; 3] = [item1, item2, item3]
+            return items[1].value
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn multiple_indexing() -> anyhow::Result<()> {
+    // Test that multiple indexing operations work correctly
+    semantic_analyze(
+        "fun f() -> i32 {
+            let row1: [i32; 2] = [1, 2]
+            let row2: [i32; 2] = [3, 4]
+            let matrix: [[i32; 2]; 2] = [row1, row2]
+            return matrix[0][1]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn method_call_and_indexing() -> anyhow::Result<()> {
+    // Test that method call followed by indexing works correctly
+    semantic_analyze(
+        "struct Container { items: [i32; 3] }
+        impl Container {
+            fun get_items(self) -> [i32; 3] {
+                return self.items
+            }
+        }
+        fun f() -> i32 {
+            let c = Container { items: [10, 20, 30] }
+            return c.get_items()[1]
+        }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn complex_chaining() -> anyhow::Result<()> {
+    // Test complex chaining of field access, indexing, and method calls
+    semantic_analyze(
+        "struct Inner { values: [i32; 2] }
+        struct Outer { inners: [Inner; 2] }
+        fun f() -> i32 {
+            let inner1 = Inner { values: [1, 2] }
+            let inner2 = Inner { values: [3, 4] }
+            let outer = Outer { inners: [inner1, inner2] }
+            return outer.inners[0].values[1]
+        }",
+    )?;
+    Ok(())
+}
+
+fn find_function_body(ir: kaede_ir::CompileUnit, name: &str) -> kaede_ir::stmt::Block {
+    for top in ir.top_levels {
+        if let TopLevel::Fn(f) = top {
+            if f.decl.name.symbol().as_str() == name {
+                return f.body.clone().expect("expected function body");
+            }
+        }
+    }
+    panic!("no function found");
+}
+
+#[test]
+fn closure_captures_outer_variables() -> anyhow::Result<()> {
+    let ir = semantic_analyze(
+        "
+        fun f() -> i32 {
+            let a: i32 = 10
+            let b: i32 = 2
+            let c = | | a + b
+            return 0
+        }
+    ",
+    )?;
+
+    let body = find_function_body(ir, "f");
+
+    let closure_expr = match &body.body[2] {
+        Stmt::Let(let_stmt) => let_stmt.init.as_ref().unwrap(),
+        _ => panic!("expected let binding for closure"),
+    };
+
+    let (captures, param_len, capture_tys_len) = match &closure_expr.kind {
+        IrExprKind::Closure(closure) => {
+            let captured: HashSet<Symbol> = closure
+                .captures
+                .iter()
+                .map(|c| match &c.kind {
+                    IrExprKind::Variable(v) => v.name,
+                    _ => panic!("unexpected capture kind"),
+                })
+                .collect();
+
+            let captured_tys_len = match closure_expr.ty.kind.as_ref() {
+                IrTyKind::Closure(ty) => ty.captures.len(),
+                _ => panic!("expected closure type"),
+            };
+
+            (captured, closure.params.len(), captured_tys_len)
+        }
+        kind => panic!("expected closure expr, got {kind:?}"),
+    };
+
+    assert_eq!(
+        captures,
+        HashSet::from([Symbol::from("a".to_string()), Symbol::from("b".to_string())])
+    );
+    assert_eq!(param_len, 0);
+    assert_eq!(capture_tys_len, 2);
+
+    Ok(())
+}
+
+#[test]
+fn closure_captures_local_closure_callee() -> anyhow::Result<()> {
+    let ir = semantic_analyze(
+        "
+        fun f() -> i32 {
+            let add = |n| n + 1
+            let use_add = |n| add(n) + 1
+            return use_add(56)
+        }
+    ",
+    )?;
+
+    let body = find_function_body(ir, "f");
+
+    let closure_expr = match &body.body[1] {
+        Stmt::Let(let_stmt) => let_stmt.init.as_ref().unwrap(),
+        _ => panic!("expected let binding for closure"),
+    };
+
+    let (captures, capture_tys_len) = match &closure_expr.kind {
+        IrExprKind::Closure(closure) => {
+            let captured: HashSet<Symbol> = closure
+                .captures
+                .iter()
+                .map(|c| match &c.kind {
+                    IrExprKind::Variable(v) => v.name,
+                    _ => panic!("unexpected capture kind"),
+                })
+                .collect();
+
+            let captured_tys_len = match closure_expr.ty.kind.as_ref() {
+                IrTyKind::Closure(ty) => ty.captures.len(),
+                _ => panic!("expected closure type"),
+            };
+
+            (captured, captured_tys_len)
+        }
+        kind => panic!("expected closure expr, got {kind:?}"),
+    };
+
+    assert_eq!(captures, HashSet::from([Symbol::from("add".to_string())]));
+    assert_eq!(capture_tys_len, 1);
+
+    Ok(())
+}
+
+#[test]
+fn generated_generic_fn_body_does_not_capture_call_site_locals() -> anyhow::Result<()> {
+    let ir = semantic_analyze(
+        "
+        fun id<T>(value: T) -> T {
+            return value
+        }
+
+        fun f() -> i32 {
+            let value = 58
+            let closure = || id(1)
+            return closure()
+        }
+    ",
+    )?;
+
+    let body = find_function_body(ir, "f");
+
+    let closure_expr = match &body.body[1] {
+        Stmt::Let(let_stmt) => let_stmt.init.as_ref().unwrap(),
+        _ => panic!("expected let binding for closure"),
+    };
+
+    let captures: HashSet<Symbol> = match &closure_expr.kind {
+        IrExprKind::Closure(closure) => closure
+            .captures
+            .iter()
+            .map(|capture| match &capture.kind {
+                IrExprKind::Variable(variable) => variable.name,
+                _ => panic!("unexpected capture kind"),
+            })
+            .collect(),
+        kind => panic!("expected closure expr, got {kind:?}"),
+    };
+
+    assert!(captures.is_empty(), "unexpected captures: {captures:?}");
+
+    Ok(())
+}
+
+#[test]
+fn generated_slice_impl_body_does_not_use_call_site_capture_stack() -> anyhow::Result<()> {
+    semantic_analyze_no_autoload(
+        "
+        impl<T> [T] {
+            fun first(self) -> T {
+                return self[0]
+            }
+        }
+
+        fun f() -> i32 {
+            let closure = || [1, 2].first()
+            return closure()
+        }
+    ",
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn keyword_arguments_reorder() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun add(a: i32, b: i32) -> i32 { return a + b }
+        fun main() -> i32 { return add(b = 2, a = 1) }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn keyword_arguments_mixed_with_positionals() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun mix(a: i32, b: i32, c: i32) -> i32 { return a + b + c }
+        fun main() -> i32 { return mix(1, c = 3, b = 2) }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn keyword_argument_unknown_param() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        "fun f(a: i32) { }
+        fun main() { f(b = 1) }",
+    )?;
+
+    assert!(err.to_string().contains("unknown parameter `b`"));
+    Ok(())
+}
+
+#[test]
+fn keyword_argument_duplicate() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        "fun f(a: i32) { }
+        fun main() { f(a = 1, a = 2) }",
+    )?;
+
+    assert!(err
+        .to_string()
+        .contains("argument for parameter `a` specified multiple times"));
+    Ok(())
+}
+
+#[test]
+fn positional_after_keyword_is_error() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        "fun f(a: i32, b: i32) { }
+        fun main() { f(a = 1, 2) }",
+    )?;
+
+    assert!(err
+        .to_string()
+        .contains("positional arguments cannot follow keyword arguments"));
+    Ok(())
+}
+
+#[test]
+fn default_argument_used() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun greet(message: i32 = 7) { let _ = message }
+        fun main() { greet() }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn default_argument_with_keyword_override() -> anyhow::Result<()> {
+    semantic_analyze(
+        "fun mix(a: i32, b: i32 = 2, c: i32 = 3) -> i32 { return a + b + c }
+        fun main() -> i32 { return mix(1, c = 10) }",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn missing_required_argument_is_error() -> anyhow::Result<()> {
+    let err = semantic_analyze_expect_error(
+        "fun f(a: i32, b: i32 = 1) { }
+        fun main() { f() }",
+    )?;
+
+    assert!(err.to_string().contains("too few arguments"));
+    Ok(())
+}

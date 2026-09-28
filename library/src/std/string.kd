@@ -1,0 +1,497 @@
+import std.collections
+import std.option
+
+use std.collections.Vector
+use std.option.Option
+
+fun fnv1a_bytes(ptr: *u8, len: u64) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325
+    let prime: u64 = 0x100000001b3
+    let bytes = __slice_from_raw_parts(ptr, len)
+    let mut i = 0
+    while i < len {
+        h = h ^ (bytes[i] as u64)
+        h = h * prime
+        i += 1
+    }
+    return h
+}
+
+// Compares two byte slices for exact equality. Exported for re-use across
+// stdlib modules (e.g. net.http) so each module does not maintain its own copy.
+export fun bytes_eq(left: [u8], right: [u8]) -> bool {
+    if left.len() != right.len() {
+        return false
+    }
+    let mut i = 0
+    while i < left.len() {
+        if left[i] != right[i] {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+export fun cstring_len(buf: [u8]) -> u64 {
+    let mut i = 0
+    while i < buf.len() {
+        if buf[i] == 0 {
+            return i
+        }
+        i += 1
+    }
+    return buf.len()
+}
+
+extern "C" fun kaede_utf8_char_at(s: *u8, len: u64, index: u64) -> char
+extern "C" fun kaede_utf8_char_count(s: *u8, len: u64) -> u64
+extern "C" fun kaede_utf8_byte_index_of_char(s: *u8, len: u64, index: u64) -> u64
+extern "C" fun kaede_f64_to_string(value: f64, buf: *u8, cap: u64) -> u64
+
+export struct String {
+    bytes: Vector<u8>,
+}
+
+impl String {
+    export fun new() -> mut String {
+        return String { bytes: Vector<u8>::new() }
+    }
+
+    export fun from(s: str) -> mut String {
+        return String { bytes: s.to_bytes() }
+    }
+
+    export fun from_bytes(bytes: [u8]) -> String {
+        return String { bytes: Vector<u8>::from_slice(bytes) }
+    }
+
+    export fun as_ptr(self) -> *u8 {
+        return self.bytes.as_ptr()
+    }
+
+    export fun len(self) -> u64 {
+        return kaede_utf8_char_count(self.as_ptr(), self.bytes.len())
+    }
+
+    export fun as_str(self) -> str {
+        return __str(self.as_ptr(), self.bytes.len())
+    }
+
+    export fun hash(self) -> u64 {
+        return fnv1a_bytes(self.as_ptr(), self.bytes.len())
+    }
+
+    export fun eq(self, other: String) -> bool {
+        let a = __slice_from_raw_parts(self.as_ptr(), self.bytes.len())
+        let b = __slice_from_raw_parts(other.as_ptr(), other.bytes.len())
+        return bytes_eq(a, b)
+    }
+
+    export fun at(self, idx: u64) -> Option<char> {
+        if idx >= self.len() {
+            return Option::None
+        }
+
+        return Option::Some(kaede_utf8_char_at(self.as_ptr(), self.bytes.len(), idx))
+    }
+
+    export fun push(mut self, ch: char) {
+        let code = ch as u32
+
+        if code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) {
+            panic("invalid Unicode scalar value")
+        }
+
+        if code <= 0x7F {
+            self.bytes.push(code as u8)
+            return
+        }
+
+        if code <= 0x7FF {
+            self.bytes.push((0xC0 + (code >> 6)) as u8)
+            self.bytes.push((0x80 + (code & 0x3F)) as u8)
+            return
+        }
+
+        if code <= 0xFFFF {
+            self.bytes.push((0xE0 + (code >> 12)) as u8)
+            self.bytes.push((0x80 + ((code >> 6) & 0x3F)) as u8)
+            self.bytes.push((0x80 + (code & 0x3F)) as u8)
+            return
+        }
+
+        self.bytes.push((0xF0 + (code >> 18)) as u8)
+        self.bytes.push((0x80 + ((code >> 12) & 0x3F)) as u8)
+        self.bytes.push((0x80 + ((code >> 6) & 0x3F)) as u8)
+        self.bytes.push((0x80 + (code & 0x3F)) as u8)
+    }
+
+    export fun clone(self) -> String {
+        return String { bytes: Vector<u8>::from_slice(self.bytes.as_slice()) }
+    }
+
+    export fun push_str(mut self, s: str) {
+        let bytes = s.to_bytes()
+        let slice = bytes.as_slice()
+        let mut i = 0
+        while i < bytes.len() {
+            self.bytes.push(slice[i])
+            i += 1
+        }
+    }
+
+    export fun push_line(mut self, s: str) {
+        self.push_str(s)
+        self.push('\n')
+    }
+
+    // Returns substring from start (inclusive) to end (exclusive). Like [start:end] slice syntax.
+    // Returns empty string if start >= end or start >= len.
+    export fun slice(self, start: u64, end: u64) -> String {
+        let len = self.len()
+        let safe_start = if start > len { len } else { start }
+        let safe_end = if end > len { len } else { end }
+        if safe_start >= safe_end {
+            return String::new()
+        }
+
+        let byte_start = kaede_utf8_byte_index_of_char(self.as_ptr(), self.bytes.len(), safe_start)
+        let byte_end = kaede_utf8_byte_index_of_char(self.as_ptr(), self.bytes.len(), safe_end)
+        return String { bytes: Vector<u8>::from_slice(self.bytes.as_slice()[byte_start:byte_end]) }
+    }
+
+    export fun to_string(self) -> String {
+        return self
+    }
+}
+
+fun parse_u64_from_str(s: str) -> Option<u64> {
+    let chars_len = kaede_utf8_char_count(s.as_ptr(), s.len())
+    if chars_len == 0 {
+        return Option::None
+    }
+
+    let max = ~(0 as u64)
+    let div10 = max / 10
+    let mod10 = max % 10
+
+    let mut i = 0
+    let mut val: u64 = 0
+    while i < chars_len {
+        let ch = s[i]
+        if ch < '0' || ch > '9' {
+            return Option::None
+        }
+
+        let digit = (ch - '0') as u64
+        if val > div10 || (val == div10 && digit > mod10) {
+            return Option::None
+        }
+
+        val = (val * 10) + digit
+        i += 1
+    }
+
+    return Option::Some(val)
+}
+
+fun parse_i64_from_str(s: str) -> Option<i64> {
+    let chars_len = kaede_utf8_char_count(s.as_ptr(), s.len())
+    if chars_len == 0 {
+        return Option::None
+    }
+
+    let i64_max = (~(0 as u64)) >> 1
+    let i64_min_abs = i64_max + 1
+
+    let mut i = 0
+    let mut neg = false
+    if s[0] == '-' {
+        neg = true
+        i = 1
+        if i >= chars_len {
+            return Option::None
+        }
+    }
+
+    let limit = if neg { i64_min_abs } else { i64_max }
+    let div10 = limit / 10
+    let mod10 = limit % 10
+
+    let mut val: u64 = 0
+    while i < chars_len {
+        let ch = s[i]
+        if ch < '0' || ch > '9' {
+            return Option::None
+        }
+
+        let digit = (ch - '0') as u64
+        if val > div10 || (val == div10 && digit > mod10) {
+            return Option::None
+        }
+
+        val = (val * 10) + digit
+        i += 1
+    }
+
+    if neg {
+        if val == i64_min_abs {
+            return Option::Some((-9223372036854775807) - 1)
+        }
+        return Option::Some(0 - (val as i64))
+    }
+
+    return Option::Some(val as i64)
+}
+
+fun u64_to_string(n: u64) -> String {
+    let mut x = n
+    if x == 0 {
+        let mut out = String::new()
+        out.push('0')
+        return out
+    }
+
+    let mut rev = String::new()
+    while x > 0 {
+        let d = x % 10
+        rev.push(d as char + '0')
+        x = x / 10
+    }
+
+    let mut out = String::new()
+    let mut i = rev.len()
+    loop {
+        if i == 0 {
+            break
+        }
+        i -= 1
+        out.push(rev.as_str()[i])
+    }
+    return out
+}
+
+fun f64_to_string(n: f64) -> String {
+    // 32 bytes covers any "%g"-formatted f64 with room to spare.
+    mut buf := Vector<u8>::new()
+    mut i := 0
+    while i < 32 {
+        buf.push(0 as u8)
+        i += 1
+    }
+
+    written := kaede_f64_to_string(n, buf.as_ptr(), 32)
+    return String::from_bytes(__slice_from_raw_parts(buf.as_ptr(), written))
+}
+
+fun i64_to_string(n: i64) -> String {
+    if n < 0 {
+        let mut out = String::new()
+        out.push('-')
+        let abs = (0 as u64) - (n as u64)
+
+        let digits = u64_to_string(abs)
+        let mut i = 0
+        while i < digits.len() {
+            out.push(digits.as_str()[i])
+            i += 1
+        }
+        return out
+    }
+
+    return u64_to_string(n as u64)
+}
+
+impl str {
+    // Converts a string slice to a byte vector.
+    export fun to_bytes(self) -> Vector<u8> {
+        return Vector<u8>::from_slice(__slice_from_raw_parts(self.as_ptr(), self.len()))
+    }
+
+    export fun chars_len(self) -> u64 {
+        return kaede_utf8_char_count(self.as_ptr(), self.len())
+    }
+
+    // Returns true when `self` begins with `prefix`.
+    export fun starts_with(self, prefix: str) -> bool {
+        let bytes = self.to_bytes()
+        let prefix_bytes = prefix.to_bytes()
+        if prefix_bytes.len() > bytes.len() {
+            return false
+        }
+
+        let byte_slice = bytes.as_slice()
+        let prefix_slice = prefix_bytes.as_slice()
+        let mut i = 0
+        while i < prefix_bytes.len() {
+            if byte_slice[i] != prefix_slice[i] {
+                return false
+            }
+            i += 1
+        }
+
+        return true
+    }
+
+    // Returns true when `self` ends with `suffix`.
+    export fun ends_with(self, suffix: str) -> bool {
+        let bytes = self.to_bytes()
+        let suffix_bytes = suffix.to_bytes()
+        if suffix_bytes.len() > bytes.len() {
+            return false
+        }
+
+        let byte_slice = bytes.as_slice()
+        let suffix_slice = suffix_bytes.as_slice()
+        let start = bytes.len() - suffix_bytes.len()
+        let mut i = 0
+        while i < suffix_bytes.len() {
+            if byte_slice[start + i] != suffix_slice[i] {
+                return false
+            }
+            i += 1
+        }
+
+        return true
+    }
+
+    export fun parse_u64(self) -> std.option.Option<u64> {
+        return parse_u64_from_str(self)
+    }
+
+    export fun parse_i64(self) -> std.option.Option<i64> {
+        return parse_i64_from_str(self)
+    }
+
+    export fun to_string(self) -> String {
+        return String::from(self)
+    }
+
+    export fun hash(self) -> u64 {
+        return fnv1a_bytes(self.as_ptr(), self.len())
+    }
+
+    export fun eq(self, other: str) -> bool {
+        let a = __slice_from_raw_parts(self.as_ptr(), self.len())
+        let b = __slice_from_raw_parts(other.as_ptr(), other.len())
+        return bytes_eq(a, b)
+    }
+}
+
+export interface Stringer {
+    fun to_string(self) -> String
+}
+
+// Hashable + Stringer impls for fundamental scalars. Repeated per type until
+// Kaede gains numeric-type generics or a derive mechanism (see #261).
+
+impl u64 {
+    export fun to_string(self) -> String {
+        return u64_to_string(self)
+    }
+
+    export fun hash(self) -> u64 { return self }
+    export fun eq(self, other: u64) -> bool { return self == other }
+}
+
+impl i64 {
+    export fun to_string(self) -> String {
+        return i64_to_string(self)
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: i64) -> bool { return self == other }
+}
+
+impl u8 {
+    export fun to_string(self) -> String {
+        return u64_to_string(self as u64)
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: u8) -> bool { return self == other }
+}
+
+impl u16 {
+    export fun to_string(self) -> String {
+        return u64_to_string(self as u64)
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: u16) -> bool { return self == other }
+}
+
+impl u32 {
+    export fun to_string(self) -> String {
+        return u64_to_string(self as u64)
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: u32) -> bool { return self == other }
+}
+
+impl i8 {
+    export fun to_string(self) -> String {
+        return i64_to_string(self as i64)
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: i8) -> bool { return self == other }
+}
+
+impl i16 {
+    export fun to_string(self) -> String {
+        return i64_to_string(self as i64)
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: i16) -> bool { return self == other }
+}
+
+impl i32 {
+    export fun to_string(self) -> String {
+        return i64_to_string(self as i64)
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: i32) -> bool { return self == other }
+}
+
+impl f64 {
+    export fun to_string(self) -> String {
+        return f64_to_string(self)
+    }
+}
+
+impl f32 {
+    export fun to_string(self) -> String {
+        return f64_to_string(self as f64)
+    }
+}
+
+impl bool {
+    export fun to_string(self) -> String {
+        if self {
+            return String::from("true")
+        }
+        return String::from("false")
+    }
+
+    export fun hash(self) -> u64 {
+        if self { return 1 }
+        return 0
+    }
+    export fun eq(self, other: bool) -> bool { return self == other }
+}
+
+impl char {
+    export fun to_string(self) -> String {
+        let mut s = String::new()
+        s.push(self)
+        return s
+    }
+
+    export fun hash(self) -> u64 { return self as u64 }
+    export fun eq(self, other: char) -> bool { return self == other }
+}

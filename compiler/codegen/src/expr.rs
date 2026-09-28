@@ -1,0 +1,3118 @@
+use std::{cell::RefCell, rc::Rc};
+
+use crate::{
+    error::CodegenError,
+    tcx::{SymbolTable, SymbolTableValue},
+    CodeGenerator,
+};
+
+use inkwell::{
+    module::Linkage,
+    types::{BasicType, FloatType, StructType},
+    values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue},
+    AddressSpace, FloatPredicate, IntPredicate,
+};
+
+use kaede_ir::{
+    expr::{
+        ArrayLiteral, ArrayRepeat, Binary, BinaryKind, BitNot, BuiltinFnCall, BuiltinFnCallKind,
+        ByteLiteral, ByteStringLiteral, Cast, CharLiteral, Closure, Else, EnumUnpack, EnumVariant,
+        Expr, ExprKind, FieldAccess, Float, FnCall, FnPointer, FormatPart, ITable, If, Indexing,
+        Int, InterfaceBox, InterfaceMethodCall, LogicalNot, Loop, Select, SelectOp, Slicing, Spawn,
+        StringLiteral, StructLiteral, TupleIndexing, TupleLiteral, Variable,
+    },
+    stmt::Block,
+    ty::{
+        make_fundamental_type, FundamentalType, FundamentalTypeKind, Mutability, PointerType, Ty,
+        TyKind,
+    },
+};
+use kaede_span::Span;
+use kaede_symbol::Symbol;
+
+pub type Value<'ctx> = Option<BasicValueEnum<'ctx>>;
+
+#[derive(Debug, Clone, Copy)]
+struct FormatArg<'ctx> {
+    ptr: PointerValue<'ctx>,
+    len: IntValue<'ctx>,
+}
+
+impl<'ctx> CodeGenerator<'ctx> {
+    fn array_type_info(ty: &Rc<Ty>) -> Option<(Rc<Ty>, u32)> {
+        match ty.kind.as_ref() {
+            TyKind::Reference(rty) => match rty.get_base_type().kind.as_ref() {
+                TyKind::Array((elem, len)) => Some((elem.clone(), *len)),
+                _ => None,
+            },
+            TyKind::Array((elem, len)) => Some((elem.clone(), *len)),
+            _ => None,
+        }
+    }
+
+    fn slice_element_ty(ty: &Rc<Ty>) -> Option<Rc<Ty>> {
+        match ty.kind.as_ref() {
+            TyKind::Reference(rty) => match rty.get_base_type().kind.as_ref() {
+                TyKind::Slice(elem) => Some(elem.clone()),
+                _ => None,
+            },
+            TyKind::Slice(elem) => Some(elem.clone()),
+            _ => None,
+        }
+    }
+
+    fn build_array_to_slice_conversion(
+        &mut self,
+        array_ptr: PointerValue<'ctx>,
+        array_len: u32,
+        elem_ty: &Rc<Ty>,
+    ) -> anyhow::Result<BasicValueEnum<'ctx>> {
+        let elem_llvm_ty = self.conv_to_llvm_type(elem_ty);
+        let array_llvm_ty = elem_llvm_ty.array_type(array_len);
+
+        let data_ptr = unsafe {
+            self.builder.build_in_bounds_gep(
+                array_llvm_ty,
+                array_ptr,
+                &[
+                    self.context().i32_type().const_zero(),
+                    self.context().i32_type().const_zero(),
+                ],
+                "",
+            )?
+        };
+
+        let slice_ty = Rc::new(Ty {
+            kind: TyKind::Slice(elem_ty.clone()).into(),
+            mutability: Mutability::Not,
+        });
+
+        let slice_llvm_ty = self.conv_to_llvm_type(&slice_ty);
+        let len_value = self.context().i64_type().const_int(array_len as u64, false);
+
+        let slice_ptr = self.create_gc_struct(
+            slice_llvm_ty,
+            &[
+                data_ptr.as_basic_value_enum(),
+                len_value.as_basic_value_enum(),
+            ],
+        )?;
+
+        Ok(slice_ptr.as_basic_value_enum())
+    }
+
+    pub(crate) fn coerce_value_to_type(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        value_ty: &Rc<Ty>,
+        expected_ty: &Rc<Ty>,
+    ) -> anyhow::Result<BasicValueEnum<'ctx>> {
+        if let (Some((_, array_len)), Some(slice_elem)) = (
+            Self::array_type_info(value_ty),
+            Self::slice_element_ty(expected_ty),
+        ) {
+            let slice_val = self.build_array_to_slice_conversion(
+                value.into_pointer_value(),
+                array_len,
+                &slice_elem,
+            )?;
+            return Ok(slice_val);
+        }
+
+        Ok(value)
+    }
+
+    /// Generate expression code
+    pub fn build_expr(&mut self, node: &Expr) -> anyhow::Result<Value<'ctx>> {
+        Ok(match &node.kind {
+            ExprKind::Block(block) => self.build_block_expr(block)?,
+
+            ExprKind::Break => self.build_break()?,
+
+            ExprKind::Return(value) => self.build_return(value)?,
+
+            ExprKind::Loop(loop_) => self.build_loop(loop_)?,
+
+            ExprKind::Int(int) => self.build_int(int, &node.ty)?,
+            ExprKind::Float(float) => self.build_float(float, &node.ty)?,
+
+            ExprKind::If(node) => self.build_if(node)?,
+
+            ExprKind::StructLiteral(node) => self.struct_literal(node)?,
+
+            ExprKind::StringLiteral(node) => self.build_string_literal(node)?,
+            ExprKind::ByteStringLiteral(node) => self.build_byte_string_literal(node)?,
+            ExprKind::ByteLiteral(node) => self.build_byte_literal(node)?,
+
+            ExprKind::CharLiteral(node) => self.build_char_literal(node)?,
+
+            ExprKind::LogicalNot(node) => self.build_logical_not(node)?,
+            ExprKind::BitNot(node) => self.build_bit_not(node)?,
+
+            ExprKind::Variable(node) => self.build_variable(node)?,
+
+            ExprKind::BooleanLiteral(node) => self.build_boolean_literal(*node),
+
+            ExprKind::FnCall(node) => self.build_fn_call(node)?,
+            ExprKind::GenericFnCall(node) => self.build_fn_call(&FnCall {
+                callee: node.callee.clone(),
+                args: node.args.clone(),
+                span: node.span,
+            })?,
+
+            ExprKind::FnPointer(fn_ptr) => self.build_fn_pointer(fn_ptr, &node.ty)?,
+
+            ExprKind::ArrayLiteral(node) => self.build_array_literal(node)?,
+            ExprKind::ArrayRepeat(node) => self.build_array_repeat(node)?,
+
+            ExprKind::TupleLiteral(node) => self.build_tuple_literal(node)?,
+
+            ExprKind::Cast(node) => self.build_cast(node)?,
+
+            ExprKind::Indexing(node) => self.build_indexing(node)?,
+            ExprKind::Slicing(node) => self.build_slicing(node)?,
+
+            ExprKind::Binary(node) => self.build_arithmetic_binary(node)?,
+
+            ExprKind::FieldAccess(node) => self.build_field_access(node)?,
+            ExprKind::UnresolvedFieldAccess(node) => {
+                anyhow::bail!(
+                    "internal error: unresolved field access reached codegen: {}",
+                    node.field_name
+                )
+            }
+
+            ExprKind::TupleIndexing(node) => self.build_tuple_indexing(node)?,
+
+            ExprKind::EnumVariant(node) => self.build_enum_variant(node)?,
+
+            ExprKind::BuiltinFnCall(node) => self.build_builtin_fn_call(node)?,
+
+            ExprKind::Closure(closure) => self.build_closure(closure, &node.ty)?,
+
+            ExprKind::Spawn(spawn) => self.build_spawn(spawn)?,
+
+            ExprKind::InterfaceBox(node) => self.build_interface_box(node)?,
+            ExprKind::InterfaceMethodCall(node) => self.build_interface_method_call(node)?,
+            ExprKind::Select(node) => self.build_select(node)?,
+        })
+    }
+
+    fn build_builtin_fn_call(&mut self, node: &BuiltinFnCall) -> anyhow::Result<Value<'ctx>> {
+        match &node.kind {
+            BuiltinFnCallKind::Unreachable => {
+                self.builder.build_unreachable()?;
+                Ok(None)
+            }
+
+            BuiltinFnCallKind::Str => {
+                let p = self.build_expr(&node.args.0[0])?.unwrap();
+                let len = self.build_expr(&node.args.0[1])?.unwrap();
+                self.build_string_literal_internal(p, len.into_int_value())
+            }
+
+            BuiltinFnCallKind::Format(parts) => self.build_format(node, parts),
+
+            BuiltinFnCallKind::SliceFromRawParts(mutability) => {
+                let data_ptr = self
+                    .build_expr(&node.args.0[0])?
+                    .unwrap()
+                    .into_pointer_value();
+                let len = self.build_expr(&node.args.0[1])?.unwrap().into_int_value();
+                let len_u64 = if len.get_type() == self.context().i64_type() {
+                    len
+                } else {
+                    self.builder
+                        .build_int_cast(len, self.context().i64_type(), "slice.len.cast")?
+                };
+
+                let elem_ty = match node.args.0[0].ty.kind.as_ref() {
+                    TyKind::Pointer(pty) => pty.pointee_ty.clone(),
+                    TyKind::Reference(rty) => match rty.get_base_type().kind.as_ref() {
+                        TyKind::Pointer(pty) => pty.pointee_ty.clone(),
+                        _ => return Err(CodegenError::ExpectedPointerType.into()),
+                    },
+                    _ => return Err(CodegenError::ExpectedPointerType.into()),
+                };
+
+                let slice_ty = Rc::new(Ty {
+                    kind: TyKind::Slice(elem_ty).into(),
+                    mutability: *mutability,
+                });
+                let slice_llvm_ty = self.conv_to_llvm_type(&slice_ty);
+                let slice_ptr = self.create_gc_struct(
+                    slice_llvm_ty,
+                    &[data_ptr.into(), len_u64.as_basic_value_enum()],
+                )?;
+
+                Ok(Some(slice_ptr.into()))
+            }
+
+            BuiltinFnCallKind::PointerAdd => {
+                let ptr = self
+                    .build_expr(&node.args.0[0])?
+                    .unwrap()
+                    .into_pointer_value();
+                let offset = self.build_expr(&node.args.0[1])?.unwrap().into_int_value();
+
+                // Get the pointee type from the first argument's type
+                let pointee_ty = if let TyKind::Pointer(pty) = node.args.0[0].ty.kind.as_ref() {
+                    &pty.pointee_ty
+                } else {
+                    return Err(CodegenError::ExpectedPointerType.into());
+                };
+
+                let llvm_pointee_ty = self.conv_to_llvm_type(pointee_ty);
+
+                let result_ptr = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(llvm_pointee_ty, ptr, &[offset], "")?
+                };
+
+                Ok(Some(result_ptr.into()))
+            }
+
+            BuiltinFnCallKind::SizeOf => {
+                let llvm_ty = self.conv_to_llvm_type(&node.args.0[0].ty);
+                let size_val = llvm_ty.size_of().unwrap();
+                let u64_ty = self.context().i64_type();
+
+                let size_u64 = if size_val.get_type() == u64_ty {
+                    size_val
+                } else {
+                    self.builder
+                        .build_int_cast(size_val, u64_ty, "sizeof.cast")?
+                };
+
+                Ok(Some(size_u64.as_basic_value_enum()))
+            }
+
+            BuiltinFnCallKind::TypeSize(ty) => {
+                let llvm_ty = self.conv_to_llvm_type(ty);
+                let size_val = llvm_ty.size_of().unwrap();
+                let u64_ty = self.context().i64_type();
+
+                let size_u64 = if size_val.get_type() == u64_ty {
+                    size_val
+                } else {
+                    self.builder
+                        .build_int_cast(size_val, u64_ty, "type_size.cast")?
+                };
+
+                Ok(Some(size_u64.as_basic_value_enum()))
+            }
+
+            BuiltinFnCallKind::Panic => {
+                self.build_panic(node)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn append_bytes_to_buffer(
+        &mut self,
+        dst_buf: PointerValue<'ctx>,
+        write_offset: IntValue<'ctx>,
+        src_ptr: PointerValue<'ctx>,
+        src_len: IntValue<'ctx>,
+    ) -> anyhow::Result<IntValue<'ctx>> {
+        let i8_ty = self.context().i8_type();
+        let dst_part = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_ty, dst_buf, &[write_offset], "format.gep")?
+        };
+        self.memcpy_bytes(dst_part, src_ptr, src_len)?;
+        Ok(self
+            .builder
+            .build_int_add(write_offset, src_len, "format.off.next")?)
+    }
+
+    fn collect_format_args(
+        &mut self,
+        node: &BuiltinFnCall,
+        str_llvm_ty: inkwell::types::StructType<'ctx>,
+        mut total_len: IntValue<'ctx>,
+    ) -> anyhow::Result<(Vec<FormatArg<'ctx>>, IntValue<'ctx>)> {
+        let mut args = Vec::with_capacity(node.args.0.len().saturating_sub(1));
+        for arg in node.args.0.iter().skip(1) {
+            let arg_val = self.build_expr(arg)?.unwrap();
+            let (arg_ptr, arg_len) = self.load_str_ptr_and_len(arg_val, str_llvm_ty)?;
+            total_len = self
+                .builder
+                .build_int_add(total_len, arg_len, "format.arg.sum")?;
+            args.push(FormatArg {
+                ptr: arg_ptr,
+                len: arg_len,
+            });
+        }
+        Ok((args, total_len))
+    }
+
+    fn build_format(
+        &mut self,
+        node: &BuiltinFnCall,
+        parts: &[FormatPart],
+    ) -> anyhow::Result<Value<'ctx>> {
+        let placeholders = parts
+            .iter()
+            .filter(|part| matches!(part, FormatPart::Placeholder))
+            .count();
+        if placeholders != node.args.0.len().saturating_sub(1) {
+            anyhow::bail!(
+                "format placeholder count mismatch: expected {}, got {}",
+                placeholders,
+                node.args.0.len().saturating_sub(1)
+            );
+        }
+
+        let i64_ty = self.context().i64_type();
+        let i8_ptr_ty = self.context().ptr_type(AddressSpace::default());
+        let str_llvm_ty = FundamentalType::create_llvm_str_type(self.context()).into_struct_type();
+
+        let mut total_len = i64_ty.const_zero();
+        for part in parts {
+            if let FormatPart::Literal(lit) = part {
+                let lit_len = i64_ty.const_int(lit.len() as u64, false);
+                total_len = self
+                    .builder
+                    .build_int_add(total_len, lit_len, "format.lit.sum")?;
+            }
+        }
+
+        let (format_args, total_len) = self.collect_format_args(node, str_llvm_ty, total_len)?;
+        let raw_buf = self.gc_malloc_with_size(total_len)?;
+        let dst_buf = self
+            .builder
+            .build_pointer_cast(raw_buf, i8_ptr_ty, "format.dst")?;
+
+        let mut write_offset = i64_ty.const_zero();
+        let mut arg_index = 0usize;
+
+        for part in parts {
+            match part {
+                FormatPart::Literal(lit) => {
+                    if lit.is_empty() {
+                        continue;
+                    }
+
+                    let lit_len = i64_ty.const_int(lit.len() as u64, false);
+                    let lit_global = self
+                        .builder
+                        .build_global_string_ptr(lit.as_str(), "format.lit")?;
+                    write_offset = self.append_bytes_to_buffer(
+                        dst_buf,
+                        write_offset,
+                        lit_global.as_pointer_value(),
+                        lit_len,
+                    )?;
+                }
+                FormatPart::Placeholder => {
+                    let FormatArg { ptr, len } = format_args[arg_index];
+                    arg_index += 1;
+                    write_offset = self.append_bytes_to_buffer(dst_buf, write_offset, ptr, len)?;
+                }
+            }
+        }
+
+        self.build_string_literal_internal(dst_buf.into(), total_len)
+    }
+
+    /// Emit a panic with a message fixed at compile time, for failures the
+    /// compiler detects itself rather than ones written as `panic(...)` in
+    /// Kaede source. Same stderr-then-abort shape and same " (at file:line)"
+    /// suffix as `build_panic`, but emitted as one global string since there is
+    /// no user expression to format.
+    fn build_static_panic(&mut self, message: &str, span: Span) -> anyhow::Result<()> {
+        let i32_ty = self.context().i32_type();
+        let i64_ty = self.context().i64_type();
+        let ptr_ty = self.context().ptr_type(inkwell::AddressSpace::default());
+        let write_fn_ty = i32_ty.fn_type(&[i32_ty.into(), ptr_ty.into(), i64_ty.into()], false);
+        let write_fn = self.declare_runtime_fn("write", write_fn_ty);
+
+        let void_ty = self.context().void_type();
+        let abort_fn_ty = void_ty.fn_type(&[], false);
+        let abort_fn = self.declare_runtime_fn("abort", abort_fn_ty);
+
+        let file_path = span.file.path();
+        let file_name = file_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let text = format!(
+            "panic: {} (at {}:{})\n",
+            message, file_name, span.start.line
+        );
+        let text_global = self
+            .builder
+            .build_global_string_ptr(&text, "panic.static")?;
+        self.builder.build_call(
+            write_fn,
+            &[
+                i32_ty.const_int(2, false).into(),
+                text_global.as_pointer_value().into(),
+                i64_ty.const_int(text.len() as u64, false).into(),
+            ],
+            "",
+        )?;
+
+        self.builder.build_call(abort_fn, &[], "")?;
+        self.builder.build_unreachable()?;
+
+        Ok(())
+    }
+
+    fn build_panic(&mut self, node: &BuiltinFnCall) -> anyhow::Result<()> {
+        // Declare write(fd: i32, buf: *u8, len: u64) -> i32
+        let i32_ty = self.context().i32_type();
+        let i64_ty = self.context().i64_type();
+        let ptr_ty = self.context().ptr_type(inkwell::AddressSpace::default());
+        let write_fn_ty = i32_ty.fn_type(&[i32_ty.into(), ptr_ty.into(), i64_ty.into()], false);
+        let write_fn = self.declare_runtime_fn("write", write_fn_ty);
+
+        // Declare abort()
+        let void_ty = self.context().void_type();
+        let abort_fn_ty = void_ty.fn_type(&[], false);
+        let abort_fn = self.declare_runtime_fn("abort", abort_fn_ty);
+
+        let stderr_fd = i32_ty.const_int(2, false);
+
+        // Build "panic: " prefix
+        let prefix = "panic: ";
+        let prefix_global = self
+            .builder
+            .build_global_string_ptr(prefix, "panic.prefix")?;
+        let prefix_len = i64_ty.const_int(prefix.len() as u64, false);
+        self.builder.build_call(
+            write_fn,
+            &[
+                stderr_fd.into(),
+                prefix_global.as_pointer_value().into(),
+                prefix_len.into(),
+            ],
+            "",
+        )?;
+
+        // Build user message (if provided)
+        if !node.args.0.is_empty() {
+            let msg_val = self.build_expr(&node.args.0[0])?.unwrap();
+            // msg_val is a pointer to str struct { ptr, len }
+            let str_llvm_ty =
+                FundamentalType::create_llvm_str_type(self.context()).into_struct_type();
+            let (msg_ptr, msg_len) = self.load_str_ptr_and_len(msg_val, str_llvm_ty)?;
+            self.builder.build_call(
+                write_fn,
+                &[stderr_fd.into(), msg_ptr.into(), msg_len.into()],
+                "",
+            )?;
+        }
+
+        // Build " (at file:line)\n" suffix
+        let file_path = node.span.file.path();
+        let file_name = file_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let line = node.span.start.line;
+        let suffix = format!(" (at {}:{})\n", file_name, line);
+        let suffix_global = self
+            .builder
+            .build_global_string_ptr(&suffix, "panic.suffix")?;
+        let suffix_len = i64_ty.const_int(suffix.len() as u64, false);
+        self.builder.build_call(
+            write_fn,
+            &[
+                stderr_fd.into(),
+                suffix_global.as_pointer_value().into(),
+                suffix_len.into(),
+            ],
+            "",
+        )?;
+
+        // Call abort()
+        self.builder.build_call(abort_fn, &[], "")?;
+
+        // Generate unreachable
+        self.builder.build_unreachable()?;
+
+        Ok(())
+    }
+
+    fn build_closure(&mut self, node: &Closure, ty: &Rc<Ty>) -> anyhow::Result<Value<'ctx>> {
+        // TODO: Move this to semantic analysis phase
+
+        let closure_ty = match ty.kind.as_ref() {
+            TyKind::Closure(closure_ty) => closure_ty,
+            _ => return Err(CodegenError::ExpectedClosureType.into()),
+        };
+
+        let (closure_struct_ty, closure_fn_ty, captures_tuple_ty) =
+            self.closure_llvm_types(closure_ty);
+
+        let saved_block = self.builder.get_insert_block().unwrap();
+
+        let closure_name = self.fresh_closure_name();
+        let closure_fn = self.module.add_function(
+            closure_name.as_str(),
+            closure_fn_ty,
+            Some(Linkage::Internal),
+        );
+
+        let entry_bb = self.context().append_basic_block(closure_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+
+        self.fn_return_ty_stack.push(closure_ty.ret_ty.clone());
+
+        let mut symbol_table = SymbolTable::new();
+
+        let captures_param = closure_fn.get_nth_param(0).unwrap().into_pointer_value();
+        self.load_closure_captures(
+            &mut symbol_table,
+            captures_param,
+            captures_tuple_ty,
+            closure_ty,
+            &node.captures,
+        )?;
+
+        for (idx, param) in node.params.iter().enumerate() {
+            let llvm_param_ty = self.conv_to_llvm_type(&closure_ty.param_tys[idx]);
+
+            let alloca = self.builder.build_alloca(llvm_param_ty, param.as_str())?;
+
+            self.builder
+                .build_store(alloca, closure_fn.get_nth_param(idx as u32 + 1).unwrap())?;
+
+            symbol_table.insert(
+                *param,
+                Rc::new(RefCell::new(SymbolTableValue::Variable(alloca))),
+            );
+        }
+
+        self.tcx.push_symbol_table(symbol_table);
+
+        let body_val = self.build_expr(&node.body)?;
+
+        if self.no_terminator() {
+            match closure_ty.ret_ty.kind.as_ref() {
+                TyKind::Unit => {
+                    self.builder.build_return(None)?;
+                }
+                _ => {
+                    if let Some(ret) = body_val {
+                        self.builder.build_return(Some(&ret))?;
+                    }
+                }
+            }
+        }
+
+        self.tcx.pop_symbol_table();
+
+        self.fn_return_ty_stack.pop();
+
+        self.builder.position_at_end(saved_block);
+
+        let captures_tuple_ptr =
+            self.build_closure_captures_tuple(&captures_tuple_ty, &node.captures)?;
+
+        let closure_value = self.create_gc_struct(
+            closure_struct_ty.as_basic_type_enum(),
+            &[
+                closure_fn
+                    .as_global_value()
+                    .as_pointer_value()
+                    .as_basic_value_enum(),
+                captures_tuple_ptr.into(),
+            ],
+        )?;
+
+        Ok(Some(closure_value.into()))
+    }
+
+    fn load_closure_captures(
+        &mut self,
+        symbol_table: &mut SymbolTable<'ctx>,
+        captures_ptr: PointerValue<'ctx>,
+        captures_tuple_ty: StructType<'ctx>,
+        closure_ty: &kaede_ir::ty::ClosureType,
+        captures: &[Expr],
+    ) -> anyhow::Result<()> {
+        assert_eq!(closure_ty.captures.len(), captures.len());
+
+        for (idx, capture) in captures.iter().enumerate() {
+            let name = match &capture.kind {
+                ExprKind::Variable(var) => var.name,
+                _ => return Err(CodegenError::UnsupportedCaptureExpression.into()),
+            };
+
+            let capture_llvm_ty = self.conv_to_llvm_type(&closure_ty.captures[idx]);
+
+            let gep = unsafe {
+                self.builder.build_in_bounds_gep(
+                    captures_tuple_ty,
+                    captures_ptr,
+                    &[
+                        self.context().i32_type().const_zero(),
+                        self.context().i32_type().const_int(idx as u64, false),
+                    ],
+                    "",
+                )?
+            };
+
+            let loaded = self.builder.build_load(capture_llvm_ty, gep, "")?;
+            let alloca = self.create_entry_block_alloca(name.as_str(), capture_llvm_ty)?;
+            self.builder.build_store(alloca, loaded)?;
+
+            symbol_table.insert(
+                name,
+                Rc::new(RefCell::new(SymbolTableValue::Variable(alloca))),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn build_closure_captures_tuple(
+        &mut self,
+        captures_tuple_ty: &StructType<'ctx>,
+        captures: &[Expr],
+    ) -> anyhow::Result<PointerValue<'ctx>> {
+        let mut capture_values = Vec::with_capacity(captures.len());
+
+        for capture in captures {
+            let value = self
+                .build_expr(capture)?
+                .ok_or_else(|| anyhow::anyhow!("capture expression did not produce a value"))?;
+            capture_values.push(value);
+        }
+
+        self.create_gc_struct(captures_tuple_ty.as_basic_type_enum(), &capture_values)
+    }
+
+    fn build_int(&self, int: &Int, ty: &Rc<Ty>) -> anyhow::Result<Value<'ctx>> {
+        use kaede_ir::expr::IntKind::*;
+
+        match int.kind {
+            I8(n) => Ok(Some(
+                self.context().i8_type().const_int(n as u64, true).into(),
+            )),
+
+            U8(n) => Ok(Some(
+                self.context().i8_type().const_int(n as u64, false).into(),
+            )),
+
+            I16(n) => Ok(Some(
+                self.context().i16_type().const_int(n as u64, true).into(),
+            )),
+
+            U16(n) => Ok(Some(
+                self.context().i16_type().const_int(n as u64, false).into(),
+            )),
+
+            I32(n) => Ok(Some(
+                self.context().i32_type().const_int(n as u64, true).into(),
+            )),
+
+            U32(n) => Ok(Some(
+                self.context().i32_type().const_int(n as u64, false).into(),
+            )),
+
+            I64(n) => Ok(Some(
+                self.context().i64_type().const_int(n as u64, true).into(),
+            )),
+
+            U64(n) => Ok(Some(self.context().i64_type().const_int(n, false).into())),
+
+            Infer(n) => match ty.kind.as_ref() {
+                TyKind::Fundamental(fty) => match fty.kind {
+                    FundamentalTypeKind::I8 => Ok(Some(
+                        self.context()
+                            .i8_type()
+                            .const_int(n as i8 as u64, true)
+                            .into(),
+                    )),
+                    FundamentalTypeKind::U8 => Ok(Some(
+                        self.context()
+                            .i8_type()
+                            .const_int(n as u8 as u64, false)
+                            .into(),
+                    )),
+                    FundamentalTypeKind::I16 => Ok(Some(
+                        self.context()
+                            .i16_type()
+                            .const_int(n as i16 as u64, true)
+                            .into(),
+                    )),
+                    FundamentalTypeKind::U16 => Ok(Some(
+                        self.context()
+                            .i16_type()
+                            .const_int(n as u16 as u64, false)
+                            .into(),
+                    )),
+                    FundamentalTypeKind::I32 => Ok(Some(
+                        self.context()
+                            .i32_type()
+                            .const_int(n as i32 as u64, true)
+                            .into(),
+                    )),
+                    FundamentalTypeKind::U32 => Ok(Some(
+                        self.context()
+                            .i32_type()
+                            .const_int(n as u32 as u64, false)
+                            .into(),
+                    )),
+                    FundamentalTypeKind::I64 => Ok(Some(
+                        self.context().i64_type().const_int(n as u64, true).into(),
+                    )),
+                    FundamentalTypeKind::U64 => Ok(Some(
+                        self.context().i64_type().const_int(n as u64, false).into(),
+                    )),
+                    _ => Err(CodegenError::UnresolvedInferInt.into()),
+                },
+                TyKind::Var(_) => Ok(Some(
+                    self.context()
+                        .i32_type()
+                        .const_int(n as i32 as u64, true)
+                        .into(),
+                )),
+                _ => Err(CodegenError::UnresolvedInferInt.into()),
+            },
+        }
+    }
+
+    fn build_float(&self, float: &Float, ty: &Rc<Ty>) -> anyhow::Result<Value<'ctx>> {
+        use kaede_ir::expr::FloatKind::*;
+
+        match float.kind {
+            F32(n) => Ok(Some(self.context().f32_type().const_float(n as f64).into())),
+            F64(n) => Ok(Some(self.context().f64_type().const_float(n).into())),
+            Infer(n) => match ty.kind.as_ref() {
+                TyKind::Fundamental(fty) => match fty.kind {
+                    FundamentalTypeKind::F32 => {
+                        Ok(Some(self.context().f32_type().const_float(n).into()))
+                    }
+                    FundamentalTypeKind::F64 => {
+                        Ok(Some(self.context().f64_type().const_float(n).into()))
+                    }
+                    _ => Err(CodegenError::UnresolvedInferFloat.into()),
+                },
+                TyKind::Var(_) => Ok(Some(self.context().f64_type().const_float(n).into())),
+                _ => Err(CodegenError::UnresolvedInferFloat.into()),
+            },
+        }
+    }
+
+    /// Unit value if the end of the block is not an expression
+    fn build_block_expr(&mut self, block: &Block) -> anyhow::Result<Value<'ctx>> {
+        if block.body.is_empty() && block.last_expr.is_none() {
+            return Ok(None);
+        }
+
+        self.tcx.push_symbol_table(SymbolTable::new());
+
+        for stmt in block.body.iter() {
+            // If there's already a terminator (from panic, return, break, etc.),
+            // don't generate any more code in this block
+            if !self.no_terminator() {
+                self.tcx.pop_symbol_table();
+                return Ok(None);
+            }
+            self.build_statement(stmt)?;
+        }
+
+        let value = if let Some(last_expr) = &block.last_expr {
+            // Only build last expression if there's no terminator yet
+            if self.no_terminator() {
+                self.build_expr(last_expr)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        self.tcx.pop_symbol_table();
+
+        Ok(value)
+    }
+
+    fn build_break(&self) -> anyhow::Result<Value<'ctx>> {
+        match self.loop_break_bb_stk.last() {
+            Some(bb) => {
+                self.builder.build_unconditional_branch(*bb)?;
+                Ok(None)
+            }
+
+            // Handled in semantic analysis
+            None => unreachable!(),
+        }
+    }
+
+    fn build_return(&mut self, value: &Option<Box<Expr>>) -> anyhow::Result<Value<'ctx>> {
+        match &value {
+            Some(val) => {
+                let mut value = self.build_expr(val)?.unwrap();
+
+                if let Some(expected_ty) = self.fn_return_ty_stack.last().cloned() {
+                    if !matches!(expected_ty.kind.as_ref(), TyKind::Unit) {
+                        value = self.coerce_value_to_type(value, &val.ty, &expected_ty)?;
+                    }
+                }
+
+                self.builder.build_return(Some(&value))?
+            }
+
+            None => self.builder.build_return(None)?,
+        };
+
+        Ok(None)
+    }
+
+    fn build_loop(&mut self, node: &Loop) -> anyhow::Result<Value<'ctx>> {
+        let parent = self.get_current_fn();
+
+        let body_bb = self.context().append_basic_block(parent, "loopbody");
+
+        let cont_bb = self.context().append_basic_block(parent, "loopcont");
+
+        // Setup for break statement
+        self.loop_break_bb_stk.push(cont_bb);
+
+        // Build body block
+        self.builder.build_unconditional_branch(body_bb)?;
+        self.builder.position_at_end(body_bb);
+        self.build_block(&node.body)?;
+
+        self.loop_break_bb_stk.pop();
+
+        // Loop!
+        if self.no_terminator() {
+            self.builder.build_unconditional_branch(body_bb)?;
+        }
+
+        self.builder.position_at_end(cont_bb);
+
+        Ok(None)
+    }
+
+    fn build_if(&mut self, node: &If) -> anyhow::Result<Value<'ctx>> {
+        let parent = self.get_current_fn();
+        let zero_const = self.context().bool_type().const_zero();
+
+        let cond = self.build_expr(&node.cond)?.unwrap().into_int_value();
+
+        let cond = self
+            .builder
+            .build_int_compare(IntPredicate::NE, cond, zero_const, "ifcond")?;
+
+        let then_bb = self.context().append_basic_block(parent, "then");
+        let else_bb = self.context().append_basic_block(parent, "else");
+        let cont_bb = self.context().append_basic_block(parent, "ifcont");
+
+        self.builder
+            .build_conditional_branch(cond, then_bb, else_bb)?;
+
+        // Build then block
+        self.builder.position_at_end(then_bb);
+
+        // Enum unpack (optional)
+        if let Some(enum_unpack) = &node.enum_unpack {
+            // Push symbol table for enum unpack
+            self.tcx.push_symbol_table(SymbolTable::new());
+            self.build_enum_unpack(enum_unpack)?;
+        }
+
+        // Build then code
+        let then_val = self.build_expr(&node.then)?;
+
+        // Pop symbol table for enum unpack.
+        if node.enum_unpack.is_some() {
+            self.tcx.pop_symbol_table();
+        }
+
+        // Since there can be no more than one terminator per block
+        let then_falls_through = self.no_terminator();
+        if then_falls_through {
+            self.builder.build_unconditional_branch(cont_bb)?;
+        }
+
+        let then_bb = self.builder.get_insert_block().unwrap();
+
+        // Build else block
+        self.builder.position_at_end(else_bb);
+
+        // Build else code
+        let else_val = match &node.else_ {
+            Some(else_) => match else_.as_ref() {
+                Else::If(if_) => self.build_if(if_)?,
+                Else::Block(block) => self.build_expr(block)?,
+            },
+
+            _ => {
+                if node.is_match {
+                    // Build unreachable
+                    self.builder.build_unreachable()?;
+                }
+
+                None
+            }
+        };
+
+        let else_bb = self.builder.get_insert_block().unwrap();
+
+        // Since there can be no more than one terminator per block
+        let else_falls_through = self.no_terminator();
+        if else_falls_through {
+            self.builder.build_unconditional_branch(cont_bb)?;
+        }
+
+        self.builder.position_at_end(cont_bb);
+
+        if !then_falls_through && !else_falls_through {
+            // Neither arm branches to cont_bb (e.g. both `return`), so it has
+            // no predecessors. Terminate it with `unreachable` instead of
+            // leaving it dangling — LLVM verification would otherwise reject
+            // the function for the unterminated block.
+            self.builder.build_unreachable()?;
+            return Ok(None);
+        }
+
+        // Either then_val or else_val could be never
+        let phi_ty = if then_val.is_none() {
+            return Ok(else_val);
+        } else if else_val.is_none() {
+            return Ok(then_val);
+        } else {
+            node.then.ty.clone()
+        };
+
+        let llvm_phi_ty = self.conv_to_llvm_type(&phi_ty);
+        let phi = self.builder.build_phi(llvm_phi_ty, "iftmp")?;
+
+        phi.add_incoming(&[(&then_val.unwrap(), then_bb), (&else_val.unwrap(), else_bb)]);
+
+        Ok(Some(phi.as_basic_value()))
+    }
+
+    fn build_enum_unpack(&mut self, enum_unpack: &EnumUnpack) -> anyhow::Result<()> {
+        let variant_ty_llvm = self.conv_to_llvm_type(&enum_unpack.variant_ty);
+
+        let pointee_ty = self.conv_to_llvm_type(&Ty {
+            kind: TyKind::UserDefined(enum_unpack.enum_ty.clone()).into(),
+            mutability: Mutability::Not,
+        });
+
+        let ptr = self
+            .build_expr(&enum_unpack.enum_value)?
+            .unwrap()
+            .into_pointer_value();
+
+        // { i32, [N x i8] }
+        //        ^^^^^^^^
+        let gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                pointee_ty,
+                ptr,
+                &[
+                    self.context().i32_type().const_zero(),
+                    self.context().i32_type().const_int(1_u64, false),
+                ],
+                "",
+            )?
+        };
+
+        let variant_value = self.builder.build_load(variant_ty_llvm, gep, "")?;
+
+        self.build_let_internal(enum_unpack.name, variant_ty_llvm, Some(variant_value))?;
+
+        Ok(())
+    }
+
+    fn struct_literal(&mut self, node: &StructLiteral) -> anyhow::Result<Value<'ctx>> {
+        let struct_llvm_ty = self
+            .context()
+            .get_struct_type(node.struct_info.name.mangle().as_str())
+            .unwrap();
+
+        let mut values = Vec::new();
+
+        for (field_name, field_expr) in node.values.iter() {
+            let field_info = &node
+                .struct_info
+                .fields
+                .iter()
+                .find(|f| f.name == *field_name)
+                .unwrap();
+
+            let value = self.build_expr(field_expr)?;
+            let mut basic = value.unwrap();
+            basic = self.coerce_value_to_type(basic, &field_expr.ty, &field_info.ty)?;
+
+            // To sort by offset, store offset
+            values.push((field_info.offset, basic));
+        }
+
+        // Sort in ascending order based on offset
+        values.sort_by_key(|a| a.0);
+        let values: Vec<_> = values.iter().map(|e| e.1).collect();
+
+        let value = self.create_gc_struct(struct_llvm_ty.as_basic_type_enum(), &values)?;
+
+        Ok(Some(value.into()))
+    }
+
+    fn build_byte_string_literal(
+        &mut self,
+        node: &ByteStringLiteral,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let i8_ty = self.context().i8_type();
+        let array_ty = i8_ty.array_type(node.bytes.len() as u32);
+
+        let const_bytes = node
+            .bytes
+            .iter()
+            .map(|b| i8_ty.const_int(*b as u64, false))
+            .collect::<Vec<_>>();
+
+        let array_val = i8_ty.const_array(&const_bytes);
+
+        let global_name = self.fresh_literal_name("byte_str");
+        let global = self.module.add_global(array_ty, None, global_name.as_str());
+        global.set_initializer(&array_val);
+        global.set_linkage(Linkage::Internal);
+        global.set_constant(true);
+
+        let elem_ty = Rc::new(make_fundamental_type(
+            FundamentalTypeKind::U8,
+            Mutability::Not,
+        ));
+
+        let slice_ptr = self.build_array_to_slice_conversion(
+            global.as_pointer_value(),
+            node.bytes.len() as u32,
+            &elem_ty,
+        )?;
+
+        Ok(Some(slice_ptr))
+    }
+
+    fn build_string_literal(&mut self, node: &StringLiteral) -> anyhow::Result<Value<'ctx>> {
+        let global_s = self
+            .builder
+            .build_global_string_ptr(node.syb.as_str(), "str")?;
+
+        self.build_string_literal_internal(
+            global_s.as_basic_value_enum(),
+            self.context()
+                .i64_type()
+                .const_int(node.syb.as_str().len() as u64, false),
+        )
+    }
+
+    fn build_string_literal_internal(
+        &mut self,
+        str: BasicValueEnum<'ctx>,
+        len: IntValue<'ctx>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let str_llvm_ty = self.conv_to_llvm_type(&Rc::new(make_fundamental_type(
+            FundamentalTypeKind::Str,
+            Mutability::Not,
+        )));
+
+        let p = self.create_gc_struct(str_llvm_ty, &[str, len.as_basic_value_enum()])?;
+
+        Ok(Some(p.into()))
+    }
+
+    fn build_char_literal(&mut self, node: &CharLiteral) -> anyhow::Result<Value<'ctx>> {
+        let char_val = self.context().i32_type().const_int(node.ch as u64, false);
+        Ok(Some(char_val.into()))
+    }
+
+    fn build_byte_literal(&mut self, node: &ByteLiteral) -> anyhow::Result<Value<'ctx>> {
+        let byte_val = self.context().i8_type().const_int(node.byte as u64, false);
+        Ok(Some(byte_val.into()))
+    }
+
+    fn build_logical_not(&mut self, node: &LogicalNot) -> anyhow::Result<Value<'ctx>> {
+        let operand = self.build_expr(&node.operand)?.unwrap();
+
+        let zero = operand.get_type().const_zero();
+
+        // Compared to zero, it would be equivalent to 'logical not'
+        Ok(Some(
+            self.builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    operand.into_int_value(),
+                    zero.into_int_value(),
+                    "",
+                )?
+                .into(),
+        ))
+    }
+
+    fn build_bit_not(&mut self, node: &BitNot) -> anyhow::Result<Value<'ctx>> {
+        let operand = self.build_expr(&node.operand)?.unwrap().into_int_value();
+        Ok(Some(self.builder.build_not(operand, "")?.into()))
+    }
+
+    fn build_variable(&mut self, node: &Variable) -> anyhow::Result<Value<'ctx>> {
+        let ptr = match &*self.tcx.lookup_symbol(node.name).unwrap().borrow() {
+            SymbolTableValue::Variable(var) => *var,
+            _ => unreachable!(),
+        };
+
+        let llvm_ty = self.conv_to_llvm_type(&node.ty);
+
+        Ok(Some(self.builder.build_load(llvm_ty, ptr, "")?))
+    }
+
+    fn build_boolean_literal(&self, value: bool) -> Value<'ctx> {
+        Some(
+            self.context()
+                .bool_type()
+                .const_int(value as u64, false)
+                .into(),
+        )
+    }
+
+    fn build_fn_call(&mut self, node: &FnCall) -> anyhow::Result<Value<'ctx>> {
+        let args = {
+            let mut args = Vec::new();
+
+            for (idx, arg) in node.args.0.iter().enumerate() {
+                let mut value = self.build_expr(arg)?.unwrap();
+
+                if let Some(param) = node.callee.params.get(idx) {
+                    value = self.coerce_value_to_type(value, &arg.ty, &param.ty)?;
+                }
+
+                args.push(value.into());
+            }
+
+            args
+        };
+
+        let callee_result = self.callee_symbols(&node.callee).iter().find_map(|name| {
+            self.tcx.lookup_symbol(*name).map(|symbol| {
+                let value = symbol.borrow();
+                match &*value {
+                    SymbolTableValue::Function(fn_value) => (*name, Some(*fn_value)),
+                    _ => (*name, None),
+                }
+            })
+        });
+
+        match callee_result {
+            Some((_, Some(fn_value))) => Ok(self
+                .builder
+                .build_call(fn_value, args.as_slice(), "")?
+                .try_as_basic_value()
+                .left()),
+            Some((mangled_name, None)) => self.build_closure_call(node, mangled_name, &args),
+            None => Err(CodegenError::UnknownCallee {
+                name: node.callee.name.symbol(),
+            }
+            .into()),
+        }
+    }
+
+    fn build_fn_pointer(&mut self, node: &FnPointer, ty: &Rc<Ty>) -> anyhow::Result<Value<'ctx>> {
+        let closure_ty = match ty.kind.as_ref() {
+            TyKind::Closure(closure_ty) => closure_ty,
+            _ => return Err(CodegenError::ExpectedClosureType.into()),
+        };
+
+        let fn_value = self.resolve_fn_value(&node.decl)?;
+
+        assert!(closure_ty.captures.is_empty());
+        let (closure_struct_ty, closure_fn_ty, _) = self.closure_llvm_types(closure_ty);
+
+        let saved_block = self.builder.get_insert_block().unwrap();
+        let wrapper_name = format!("fnptr_trampoline_{}", self.closure_counter);
+        self.closure_counter += 1;
+        let wrapper = self.module.add_function(
+            wrapper_name.as_str(),
+            closure_fn_ty,
+            Some(Linkage::Internal),
+        );
+        let entry = self.context().append_basic_block(wrapper, "entry");
+        self.builder.position_at_end(entry);
+
+        let forwarded_args = wrapper
+            .get_params()
+            .iter()
+            // Skip captures pointer (unused for plain functions)
+            .skip(1)
+            .map(|arg| (*arg).into())
+            .collect::<Vec<_>>();
+
+        let call = self
+            .builder
+            .build_call(fn_value, forwarded_args.as_slice(), "")?;
+        if matches!(closure_ty.ret_ty.kind.as_ref(), TyKind::Unit) {
+            self.builder.build_return(None)?;
+        } else {
+            let ret = call.try_as_basic_value().left().unwrap();
+            self.builder.build_return(Some(&ret))?;
+        }
+
+        self.builder.position_at_end(saved_block);
+
+        let fn_ptr = wrapper
+            .as_global_value()
+            .as_pointer_value()
+            .as_basic_value_enum();
+
+        let captures_ptr = self
+            .context()
+            .ptr_type(inkwell::AddressSpace::default())
+            .const_null()
+            .as_basic_value_enum();
+
+        let value = self.create_gc_struct(
+            closure_struct_ty.as_basic_type_enum(),
+            &[fn_ptr, captures_ptr],
+        )?;
+
+        Ok(Some(value.into()))
+    }
+
+    fn itable_type_key(ty: &Rc<Ty>) -> String {
+        let base = match ty.kind.as_ref() {
+            TyKind::Reference(rty) => &rty.refee_ty,
+            _ => ty,
+        };
+        match base.kind.as_ref() {
+            TyKind::UserDefined(udt) => udt.qualified_symbol().mangle().to_string(),
+            _ => unreachable!("interface box concrete type must be a user-defined type"),
+        }
+    }
+
+    fn build_or_get_itable(&mut self, itable: &ITable) -> anyhow::Result<PointerValue<'ctx>> {
+        let global_name = format!(
+            "__kd_itable.{}.{}",
+            itable.interface.name.mangle(),
+            Self::itable_type_key(&itable.concrete_ty),
+        );
+
+        if let Some(global) = self.module.get_global(&global_name) {
+            return Ok(global.as_pointer_value());
+        }
+
+        let ptr_ty = self.context().ptr_type(AddressSpace::default());
+        let array_ty = ptr_ty.array_type(itable.methods.len() as u32);
+
+        let mut fn_ptrs = Vec::with_capacity(itable.methods.len());
+        for method_decl in &itable.methods {
+            let fn_value = self.resolve_fn_value(method_decl)?;
+            fn_ptrs.push(fn_value.as_global_value().as_pointer_value());
+        }
+
+        let array_val = ptr_ty.const_array(&fn_ptrs);
+        let global = self.module.add_global(array_ty, None, global_name.as_str());
+        global.set_initializer(&array_val);
+        global.set_linkage(Linkage::Internal);
+        global.set_constant(true);
+
+        Ok(global.as_pointer_value())
+    }
+
+    fn build_interface_box(&mut self, node: &InterfaceBox) -> anyhow::Result<Value<'ctx>> {
+        let data_ptr = self
+            .build_expr(&node.value)?
+            .ok_or_else(|| CodegenError::LLVMError {
+                what: "interface box inner value produced no value".to_string(),
+            })?;
+        let itable_ptr = self.build_or_get_itable(&node.itable)?;
+
+        let fat_ty = self.interface_fat_pointer_type();
+        let value = self.create_gc_struct(
+            fat_ty.as_basic_type_enum(),
+            &[data_ptr, itable_ptr.as_basic_value_enum()],
+        )?;
+
+        Ok(Some(value.into()))
+    }
+
+    fn build_interface_method_call(
+        &mut self,
+        node: &InterfaceMethodCall,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let receiver_fat = self
+            .build_expr(&node.receiver)?
+            .ok_or_else(|| CodegenError::LLVMError {
+                what: "interface method call receiver produced no value".to_string(),
+            })?
+            .into_pointer_value();
+
+        let fat_ty = self.interface_fat_pointer_type();
+        let ptr_ty = self.context().ptr_type(AddressSpace::default());
+
+        let data_gep = self
+            .builder
+            .build_struct_gep(fat_ty, receiver_fat, 0, "iface.data.gep")?;
+        let data_ptr = self
+            .builder
+            .build_load(ptr_ty, data_gep, "iface.data")?
+            .into_pointer_value();
+
+        let itable_gep =
+            self.builder
+                .build_struct_gep(fat_ty, receiver_fat, 1, "iface.itable.gep")?;
+        let itable_ptr = self
+            .builder
+            .build_load(ptr_ty, itable_gep, "iface.itable")?
+            .into_pointer_value();
+
+        let slot_gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                ptr_ty,
+                itable_ptr,
+                &[self
+                    .context()
+                    .i32_type()
+                    .const_int(node.method_index as u64, false)],
+                "iface.method.gep",
+            )?
+        };
+        let method_fn_ptr = self
+            .builder
+            .build_load(ptr_ty, slot_gep, "iface.method")?
+            .into_pointer_value();
+
+        let mut param_llvm_tys = Vec::with_capacity(node.method.params.len() + 1);
+        param_llvm_tys.push(ptr_ty.into());
+        for param in &node.method.params {
+            param_llvm_tys.push(self.conv_to_llvm_type(&param.ty).into());
+        }
+
+        let fn_ty = if matches!(node.method.return_ty.kind.as_ref(), TyKind::Unit) {
+            self.context().void_type().fn_type(&param_llvm_tys, false)
+        } else {
+            self.conv_to_llvm_type(&node.method.return_ty)
+                .fn_type(&param_llvm_tys, false)
+        };
+
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum<'ctx>> =
+            Vec::with_capacity(node.args.0.len() + 1);
+        call_args.push(data_ptr.into());
+        for arg in &node.args.0 {
+            let value = self
+                .build_expr(arg)?
+                .ok_or_else(|| CodegenError::LLVMError {
+                    what: "interface method call argument produced no value".to_string(),
+                })?;
+            call_args.push(value.into());
+        }
+
+        let call =
+            self.builder
+                .build_indirect_call(fn_ty, method_fn_ptr, &call_args, "iface.call")?;
+        Ok(call.try_as_basic_value().left())
+    }
+
+    fn build_spawn(&mut self, node: &Spawn) -> anyhow::Result<Value<'ctx>> {
+        let args_struct_ty = if node.args.is_empty() {
+            None
+        } else {
+            Some(self.spawn_args_struct_type(&node.arg_types))
+        };
+
+        let wrapper = self.build_spawn_wrapper(node, args_struct_ty)?;
+        let (arg_ptr, arg_size) = self.build_spawn_args(node, args_struct_ty)?;
+
+        let ptr_ty = self.context().ptr_type(AddressSpace::default());
+        let spawn_fn_name = if node.is_main {
+            "kaede_spawn_main"
+        } else {
+            "kaede_spawn_with_arg"
+        };
+        let spawn_fn = self.declare_runtime_fn(
+            spawn_fn_name,
+            self.context().void_type().fn_type(
+                &[
+                    ptr_ty.into(),
+                    ptr_ty.into(),
+                    self.context().i64_type().into(),
+                ],
+                false,
+            ),
+        );
+
+        let fn_ptr = self.builder.build_pointer_cast(
+            wrapper.as_global_value().as_pointer_value(),
+            ptr_ty,
+            "",
+        )?;
+
+        self.builder.build_call(
+            spawn_fn,
+            &[fn_ptr.into(), arg_ptr.into(), arg_size.into()],
+            "",
+        )?;
+
+        Ok(None)
+    }
+
+    fn spawn_args_struct_type(&mut self, arg_types: &[Rc<Ty>]) -> StructType<'ctx> {
+        let fields = arg_types
+            .iter()
+            .map(|ty| self.conv_to_llvm_type(ty))
+            .collect::<Vec<_>>();
+        self.context().struct_type(&fields, false)
+    }
+
+    fn build_spawn_args(
+        &mut self,
+        node: &Spawn,
+        args_struct_ty: Option<StructType<'ctx>>,
+    ) -> anyhow::Result<(PointerValue<'ctx>, IntValue<'ctx>)> {
+        let ptr_ty = self.context().ptr_type(AddressSpace::default());
+        if node.args.is_empty() {
+            let zero = self.context().i64_type().const_zero();
+            return Ok((ptr_ty.const_null(), zero));
+        }
+
+        let args_struct_ty = args_struct_ty.unwrap();
+        let args_alloca =
+            self.create_entry_block_alloca("spawn.args", args_struct_ty.as_basic_type_enum())?;
+
+        for (idx, arg) in node.args.iter().enumerate() {
+            let mut value = self.build_expr(arg)?.unwrap();
+            if let Some(param) = node.callee.params.get(idx) {
+                value = self.coerce_value_to_type(value, &arg.ty, &param.ty)?;
+            }
+
+            let gep = unsafe {
+                self.builder.build_in_bounds_gep(
+                    args_struct_ty,
+                    args_alloca,
+                    &[
+                        self.context().i32_type().const_zero(),
+                        self.context().i32_type().const_int(idx as u64, false),
+                    ],
+                    "",
+                )?
+            };
+
+            self.builder.build_store(gep, value)?;
+        }
+
+        let size_val = args_struct_ty.size_of().unwrap();
+        let size_i64 =
+            self.builder
+                .build_int_cast(size_val, self.context().i64_type(), "spawn.arg_size")?;
+
+        Ok((args_alloca, size_i64))
+    }
+
+    fn build_spawn_wrapper(
+        &mut self,
+        node: &Spawn,
+        args_struct_ty: Option<StructType<'ctx>>,
+    ) -> anyhow::Result<FunctionValue<'ctx>> {
+        let wrapper_name = self.fresh_spawn_name();
+        let ptr_ty = self.context().ptr_type(AddressSpace::default());
+        let wrapper_fn = self.module.add_function(
+            wrapper_name.as_str(),
+            self.context().void_type().fn_type(&[ptr_ty.into()], false),
+            Some(Linkage::Internal),
+        );
+
+        let saved_block = self.builder.get_insert_block();
+        let entry = self.context().append_basic_block(wrapper_fn, "entry");
+        self.builder.position_at_end(entry);
+
+        let mut args = Vec::new();
+        if let Some(args_struct_ty) = args_struct_ty {
+            let arg_ptr = wrapper_fn.get_first_param().unwrap().into_pointer_value();
+            let struct_ptr = self.builder.build_pointer_cast(
+                arg_ptr,
+                self.context().ptr_type(AddressSpace::default()),
+                "",
+            )?;
+
+            for (idx, arg_ty) in node.arg_types.iter().enumerate() {
+                let gep = unsafe {
+                    self.builder.build_in_bounds_gep(
+                        args_struct_ty,
+                        struct_ptr,
+                        &[
+                            self.context().i32_type().const_zero(),
+                            self.context().i32_type().const_int(idx as u64, false),
+                        ],
+                        "",
+                    )?
+                };
+                let llvm_ty = self.conv_to_llvm_type(arg_ty);
+                let value = self.builder.build_load(llvm_ty, gep, "")?;
+                args.push(value.into());
+            }
+        }
+
+        let callee_value = self
+            .callee_symbols(&node.callee)
+            .iter()
+            .find_map(|name| {
+                self.tcx.lookup_symbol(*name).map(|symbol| {
+                    let value = symbol.borrow();
+                    match &*value {
+                        SymbolTableValue::Function(fn_value) => Some(*fn_value),
+                        _ => None,
+                    }
+                })
+            })
+            .flatten()
+            .ok_or(CodegenError::UnknownCallee {
+                name: node.callee.name.symbol(),
+            })?;
+
+        let call = self.builder.build_call(callee_value, args.as_slice(), "")?;
+
+        if node.is_main {
+            let exit_code = match node.callee.return_ty.kind.as_ref() {
+                TyKind::Fundamental(fund) if fund.kind == FundamentalTypeKind::I32 => {
+                    call.try_as_basic_value().left().unwrap().into_int_value()
+                }
+                TyKind::Unit => self.context().i32_type().const_zero(),
+                _ => self.context().i32_type().const_zero(),
+            };
+
+            let set_exit_code = self.declare_runtime_fn(
+                "kaede_runtime_set_exit_code",
+                self.context()
+                    .void_type()
+                    .fn_type(&[self.context().i32_type().into()], false),
+            );
+            self.builder
+                .build_call(set_exit_code, &[exit_code.into()], "")?;
+        }
+
+        self.builder.build_return(None)?;
+
+        if let Some(saved_block) = saved_block {
+            self.builder.position_at_end(saved_block);
+        }
+
+        Ok(wrapper_fn)
+    }
+
+    /// Layout of `struct KaedeSelectCase` in the runtime, matched in LLVM:
+    ///   { ptr, i32, i32 (pad), ptr, i32 }
+    /// Offsets 0 channel, 8 op, 12 pad, 16 value_slot, 24 status; size 32 on
+    /// LP64. `channel.h` static-asserts the C side of this.
+    /// The named constants below index this struct.
+    fn select_case_struct_type(&self) -> StructType<'ctx> {
+        let ptr_ty = self.context().ptr_type(AddressSpace::default());
+        let i32_ty = self.context().i32_type();
+        self.context().struct_type(
+            &[
+                ptr_ty.into(),
+                i32_ty.into(),
+                i32_ty.into(), // explicit padding to match C alignment
+                ptr_ty.into(),
+                i32_ty.into(),
+            ],
+            false,
+        )
+    }
+
+    fn build_select(&mut self, node: &Select) -> anyhow::Result<Value<'ctx>> {
+        // Field indices into the KaedeSelectCase struct above. Must stay in
+        // sync with library/runtime/include/kaede/channel.h.
+        const FIELD_CHANNEL: u32 = 0;
+        const FIELD_OP: u32 = 1;
+        // Field 2 is padding, present so these indices line up with the C
+        // struct. It is never read.
+        const FIELD_VALUE_SLOT: u32 = 3;
+        const FIELD_STATUS: u32 = 4;
+        // KaedeSelectStatus values, same header.
+        const STATUS_CLOSED: u64 = 1;
+
+        let parent = self.get_current_fn();
+        let case_struct_ty = self.select_case_struct_type();
+        let n = node.arms.len();
+        let array_ty = case_struct_ty.array_type(n as u32);
+        let cases_alloca = self.create_entry_block_alloca("select.cases", array_ty.into())?;
+        let i32_ty = self.context().i32_type();
+        let ptr_ty = self.context().ptr_type(AddressSpace::default());
+
+        // Allocate value slots per arm and populate the case array in source
+        // order (Go semantics: evaluate every channel/send value once up front).
+        let mut value_slots: Vec<PointerValue<'ctx>> = Vec::with_capacity(n);
+
+        for (i, arm) in node.arms.iter().enumerate() {
+            let elem_llvm_ty = self.conv_to_llvm_type(&arm.elem_ty);
+            let slot =
+                self.create_entry_block_alloca(&format!("select.slot{}", i), elem_llvm_ty)?;
+            value_slots.push(slot);
+
+            // Evaluate the channel expression and extract `Channel<T>.ptr`.
+            let channel_struct_ptr = self.build_expr(&arm.channel)?.unwrap().into_pointer_value();
+            let channel_qsym = Self::channel_struct_qsym(&arm.channel.ty)?;
+            let channel_llvm_struct = self
+                .module
+                .get_struct_type(channel_qsym.mangle().as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Channel<T> LLVM struct type not registered: {}",
+                        channel_qsym.mangle()
+                    )
+                })?;
+            let chan_ptr_gep =
+                self.builder
+                    .build_struct_gep(channel_llvm_struct, channel_struct_ptr, 0, "")?;
+            let chan_raw_ptr = self
+                .builder
+                .build_load(ptr_ty, chan_ptr_gep, "")?
+                .into_pointer_value();
+
+            if let SelectOp::Send = arm.op {
+                let value = self.build_expr(arm.value.as_ref().unwrap())?.unwrap();
+                self.builder.build_store(slot, value)?;
+            }
+
+            let case_ptr = unsafe {
+                self.builder.build_in_bounds_gep(
+                    array_ty,
+                    cases_alloca,
+                    &[i32_ty.const_zero(), i32_ty.const_int(i as u64, false)],
+                    "",
+                )?
+            };
+            let store_field = |ce: &CodeGenerator<'ctx>,
+                               field: u32,
+                               value: BasicValueEnum<'ctx>|
+             -> anyhow::Result<()> {
+                let gep = ce
+                    .builder
+                    .build_struct_gep(case_struct_ty, case_ptr, field, "")?;
+                ce.builder.build_store(gep, value)?;
+                Ok(())
+            };
+
+            let op_const = i32_ty.const_int(
+                match arm.op {
+                    SelectOp::Send => 0,
+                    SelectOp::Recv => 1,
+                },
+                false,
+            );
+            store_field(self, FIELD_CHANNEL, chan_raw_ptr.as_basic_value_enum())?;
+            store_field(self, FIELD_OP, op_const.as_basic_value_enum())?;
+            store_field(self, FIELD_VALUE_SLOT, slot.as_basic_value_enum())?;
+            store_field(
+                self,
+                FIELD_STATUS,
+                i32_ty.const_zero().as_basic_value_enum(),
+            )?;
+        }
+
+        let has_default = node.default.is_some();
+        let i64_ty = self.context().i64_type();
+        let bool_ty = self.context().bool_type();
+        let select_fn = self.declare_runtime_fn(
+            "kaede_select",
+            i32_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), bool_ty.into()], false),
+        );
+
+        let chosen = self
+            .builder
+            .build_call(
+                select_fn,
+                &[
+                    cases_alloca.as_basic_value_enum().into(),
+                    i64_ty.const_int(n as u64, false).into(),
+                    bool_ty
+                        .const_int(if has_default { 1 } else { 0 }, false)
+                        .into(),
+                ],
+                "select.chosen",
+            )?
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+
+        // Per-arm basic blocks, plus optional default block, plus a join block.
+        let mut arm_blocks: Vec<inkwell::basic_block::BasicBlock<'ctx>> = Vec::with_capacity(n);
+        for i in 0..n {
+            arm_blocks.push(
+                self.context()
+                    .append_basic_block(parent, &format!("select.arm{}", i)),
+            );
+        }
+        let default_block = if has_default {
+            Some(self.context().append_basic_block(parent, "select.default"))
+        } else {
+            None
+        };
+        let cont_block = self.context().append_basic_block(parent, "select.cont");
+
+        // Switch: -1 -> default (if any), else arm[i]. `kaede_select` also
+        // returns -1 without a `default` arm on paths where it cannot pick a
+        // case at all: the runtime is already shutting down, or a waiter
+        // allocation failed. There is no arm body to run then, so fall through
+        // past the select — mirroring how a plain `recv()` degrades to
+        // `Option::None` on shutdown. Routing -1 to `unreachable` instead would
+        // make those paths undefined behaviour.
+        let switch_default = default_block.unwrap_or(cont_block);
+        let cases: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = (0..n)
+            .map(|i| (i32_ty.const_int(i as u64, false), arm_blocks[i]))
+            .collect();
+        self.builder.build_switch(chosen, switch_default, &cases)?;
+
+        // Per-arm bodies.
+        for (i, arm) in node.arms.iter().enumerate() {
+            self.builder.position_at_end(arm_blocks[i]);
+
+            self.tcx.push_symbol_table(SymbolTable::new());
+
+            match arm.op {
+                SelectOp::Send => {
+                    // A send case also fires when the channel turned out to be
+                    // closed, in which case nothing was sent. `Channel::send`
+                    // panics there, so the select arm must not run its body as
+                    // if the value had been handed off.
+                    let case_ptr = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            array_ty,
+                            cases_alloca,
+                            &[i32_ty.const_zero(), i32_ty.const_int(i as u64, false)],
+                            "",
+                        )?
+                    };
+                    let status_gep = self.builder.build_struct_gep(
+                        case_struct_ty,
+                        case_ptr,
+                        FIELD_STATUS,
+                        "",
+                    )?;
+                    let status = self
+                        .builder
+                        .build_load(i32_ty, status_gep, "select.send_status")?
+                        .into_int_value();
+                    let is_closed = self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        status,
+                        i32_ty.const_int(STATUS_CLOSED, false),
+                        "is_closed",
+                    )?;
+                    let closed_bb = self
+                        .context()
+                        .append_basic_block(parent, "select.send_closed");
+                    let sent_bb = self.context().append_basic_block(parent, "select.sent");
+                    self.builder
+                        .build_conditional_branch(is_closed, closed_bb, sent_bb)?;
+
+                    self.builder.position_at_end(closed_bb);
+                    self.build_static_panic("send on closed channel", arm.span)?;
+
+                    self.builder.position_at_end(sent_bb);
+                    self.build_expr(&arm.body)?;
+                }
+                SelectOp::Recv => {
+                    if let Some(binding) = arm.binding {
+                        // Materialize Option<T>: read cases[i].status, branch
+                        // VALUE -> Some(load slot), CLOSED -> None.
+                        let option_ty = arm.option_ty.as_ref().unwrap();
+                        let enum_info = arm.option_enum_info.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("select recv arm missing resolved Option enum info")
+                        })?;
+                        let case_ptr = unsafe {
+                            self.builder.build_in_bounds_gep(
+                                array_ty,
+                                cases_alloca,
+                                &[i32_ty.const_zero(), i32_ty.const_int(i as u64, false)],
+                                "",
+                            )?
+                        };
+                        let status_gep = self.builder.build_struct_gep(
+                            case_struct_ty,
+                            case_ptr,
+                            FIELD_STATUS,
+                            "",
+                        )?;
+                        let option_value =
+                            self.build_recv_option(enum_info, value_slots[i], status_gep)?;
+                        let option_llvm_ty = self.conv_to_llvm_type(option_ty);
+                        self.build_let_internal(binding, option_llvm_ty, Some(option_value))?;
+                    }
+                    self.build_expr(&arm.body)?;
+                }
+            }
+
+            self.tcx.pop_symbol_table();
+
+            if self.no_terminator() {
+                self.builder.build_unconditional_branch(cont_block)?;
+            }
+        }
+
+        // Default body.
+        if let (Some(default_block), Some(default_body)) = (default_block, &node.default) {
+            self.builder.position_at_end(default_block);
+            self.tcx.push_symbol_table(SymbolTable::new());
+            self.build_expr(default_body)?;
+            self.tcx.pop_symbol_table();
+            if self.no_terminator() {
+                self.builder.build_unconditional_branch(cont_block)?;
+            }
+        }
+
+        self.builder.position_at_end(cont_block);
+        Ok(None)
+    }
+
+    fn build_recv_option(
+        &mut self,
+        enum_info: &Rc<kaede_ir::top::Enum>,
+        value_slot: PointerValue<'ctx>,
+        status_gep: PointerValue<'ctx>,
+    ) -> anyhow::Result<BasicValueEnum<'ctx>> {
+        let some_variant = enum_info
+            .variants
+            .iter()
+            .find(|v| v.name.as_str() == "Some")
+            .ok_or_else(|| anyhow::anyhow!("Option enum is missing Some variant"))?;
+        let none_variant = enum_info
+            .variants
+            .iter()
+            .find(|v| v.name.as_str() == "None")
+            .ok_or_else(|| anyhow::anyhow!("Option enum is missing None variant"))?;
+        let enum_llvm_ty = self
+            .module
+            .get_struct_type(enum_info.name.mangle().as_str())
+            .ok_or_else(|| anyhow::anyhow!("Option enum LLVM type not registered"))?;
+        let payload_ty = some_variant
+            .ty
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Option::Some variant has no payload type"))?;
+
+        let i32_ty = self.context().i32_type();
+        let status = self
+            .builder
+            .build_load(i32_ty, status_gep, "select.status")?
+            .into_int_value();
+
+        let parent = self.get_current_fn();
+        let some_bb = self.context().append_basic_block(parent, "recv.some");
+        let none_bb = self.context().append_basic_block(parent, "recv.none");
+        let join_bb = self.context().append_basic_block(parent, "recv.join");
+
+        // KAEDE_SELECT_STATUS_VALUE = 0. status == 0 → Some, else None.
+        let is_value = self.builder.build_int_compare(
+            IntPredicate::EQ,
+            status,
+            i32_ty.const_zero(),
+            "is_value",
+        )?;
+        self.builder
+            .build_conditional_branch(is_value, some_bb, none_bb)?;
+
+        self.builder.position_at_end(some_bb);
+        let payload_llvm_ty = self.conv_to_llvm_type(payload_ty);
+        let loaded_value = self.builder.build_load(payload_llvm_ty, value_slot, "")?;
+        let some_struct = self.create_gc_struct(
+            enum_llvm_ty.as_basic_type_enum(),
+            &[
+                i32_ty.const_int(some_variant.offset as u64, false).into(),
+                loaded_value,
+            ],
+        )?;
+        self.builder.build_unconditional_branch(join_bb)?;
+        let some_bb_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(none_bb);
+        let none_struct = self.create_gc_struct(
+            enum_llvm_ty.as_basic_type_enum(),
+            &[i32_ty.const_int(none_variant.offset as u64, false).into()],
+        )?;
+        self.builder.build_unconditional_branch(join_bb)?;
+        let none_bb_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(join_bb);
+        let phi = self
+            .builder
+            .build_phi(self.context().ptr_type(AddressSpace::default()), "recv.phi")?;
+        phi.add_incoming(&[(&some_struct, some_bb_end), (&none_struct, none_bb_end)]);
+        Ok(phi.as_basic_value())
+    }
+
+    /// For a `Reference<Channel<T>>` (or bare `Channel<T>`) operand type, return
+    /// the qualified symbol naming the LLVM struct type for `Channel<T>`.
+    fn channel_struct_qsym(ty: &Ty) -> anyhow::Result<kaede_ir::qualified_symbol::QualifiedSymbol> {
+        let base = match ty.kind.as_ref() {
+            TyKind::Reference(rty) => rty.get_base_type(),
+            _ => return Self::channel_struct_qsym_from_udt_ty(ty),
+        };
+        Self::channel_struct_qsym_from_udt_ty(&base)
+    }
+
+    fn channel_struct_qsym_from_udt_ty(
+        ty: &Ty,
+    ) -> anyhow::Result<kaede_ir::qualified_symbol::QualifiedSymbol> {
+        let TyKind::UserDefined(udt) = ty.kind.as_ref() else {
+            anyhow::bail!("select channel arm operand is not a user-defined type");
+        };
+        match &udt.kind {
+            kaede_ir::ty::UserDefinedTypeKind::Struct(s) => Ok(s.name.clone()),
+            kaede_ir::ty::UserDefinedTypeKind::Placeholder(qsym) => Ok(qsym.clone()),
+            _ => anyhow::bail!("select channel arm operand is not Channel<T>"),
+        }
+    }
+
+    fn declare_runtime_fn(
+        &mut self,
+        name: &str,
+        fn_type: inkwell::types::FunctionType<'ctx>,
+    ) -> FunctionValue<'ctx> {
+        if let Some(existing) = self.module.get_function(name) {
+            return existing;
+        }
+
+        self.module
+            .add_function(name, fn_type, Some(Linkage::External))
+    }
+
+    fn resolve_fn_value(
+        &self,
+        decl: &kaede_ir::top::FnDecl,
+    ) -> anyhow::Result<FunctionValue<'ctx>> {
+        self.callee_symbols(decl)
+            .iter()
+            .find_map(|name| match self.tcx.lookup_symbol(*name) {
+                Some(value) => match &*value.borrow() {
+                    SymbolTableValue::Function(fv) => Some(*fv),
+                    _ => None,
+                },
+                None => None,
+            })
+            .ok_or_else(|| {
+                CodegenError::UnknownCallee {
+                    name: decl.name.symbol(),
+                }
+                .into()
+            })
+    }
+
+    /// Candidate names to look up a callee in the symbol table, in priority order.
+    ///
+    /// The symbol table's key is not uniform across linkages: Default-linkage functions
+    /// are registered under their mangled (module-qualified) name, C-linkage functions
+    /// under the bare name. Callers don't always know which one was used, so we return
+    /// both and let the caller try them in turn.
+    fn callee_symbols(&self, callee: &kaede_ir::top::FnDecl) -> Vec<Symbol> {
+        use kaede_common::LangLinkage;
+
+        let mut names = match callee.lang_linkage {
+            LangLinkage::Default => vec![callee.name.mangle()],
+            LangLinkage::C => vec![callee.name.symbol()],
+        };
+
+        let base_name = callee.name.symbol();
+        if !names.contains(&base_name) {
+            names.push(base_name);
+        }
+
+        names
+    }
+
+    fn build_closure_call(
+        &mut self,
+        node: &FnCall,
+        mangled_name: Symbol,
+        args: &[inkwell::values::BasicMetadataValueEnum<'ctx>],
+    ) -> anyhow::Result<Value<'ctx>> {
+        let callee_ptr = match self.tcx.lookup_symbol(mangled_name) {
+            Some(value) => match &*value.borrow() {
+                SymbolTableValue::Variable(var) => *var,
+                _ => return Err(CodegenError::CalleeNotClosureValue { name: mangled_name }.into()),
+            },
+
+            None => {
+                return Err(CodegenError::UnknownCallee {
+                    name: node.callee.name.symbol(),
+                }
+                .into())
+            }
+        };
+
+        let ptr_ty = self.context().ptr_type(inkwell::AddressSpace::default());
+        let closure_struct_ty = self
+            .context()
+            .struct_type(&[ptr_ty.into(), ptr_ty.into()], false);
+
+        let closure_ptr = self
+            .builder
+            .build_load(ptr_ty, callee_ptr, "")?
+            .into_pointer_value();
+
+        let fn_gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                closure_struct_ty,
+                closure_ptr,
+                &[
+                    self.context().i32_type().const_zero(),
+                    self.context().i32_type().const_zero(),
+                ],
+                "",
+            )?
+        };
+
+        let captures_gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                closure_struct_ty,
+                closure_ptr,
+                &[
+                    self.context().i32_type().const_zero(),
+                    self.context().i32_type().const_int(1, false),
+                ],
+                "",
+            )?
+        };
+
+        let fn_ptr = self.builder.build_load(ptr_ty, fn_gep, "")?;
+        let captures_ptr = self.builder.build_load(ptr_ty, captures_gep, "")?;
+
+        let mut call_param_types = Vec::with_capacity(node.callee.params.len() + 1);
+        call_param_types.push(ptr_ty.into());
+        for param in &node.callee.params {
+            call_param_types.push(self.conv_to_llvm_type(&param.ty).into());
+        }
+
+        let closure_fn_ty = if matches!(node.callee.return_ty.kind.as_ref(), TyKind::Unit) {
+            self.context()
+                .void_type()
+                .fn_type(call_param_types.as_slice(), false)
+        } else {
+            self.conv_to_llvm_type(&node.callee.return_ty)
+                .fn_type(call_param_types.as_slice(), false)
+        };
+
+        #[allow(deprecated)]
+        let fn_ptr_cast = self.builder.build_pointer_cast(
+            fn_ptr.into_pointer_value(),
+            closure_fn_ty.ptr_type(inkwell::AddressSpace::default()),
+            "",
+        )?;
+
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(captures_ptr.into());
+        call_args.extend_from_slice(args);
+
+        Ok(self
+            .builder
+            .build_indirect_call(closure_fn_ty, fn_ptr_cast, call_args.as_slice(), "")?
+            .try_as_basic_value()
+            .left())
+    }
+
+    fn build_array_literal(&mut self, node: &ArrayLiteral) -> anyhow::Result<Value<'ctx>> {
+        assert!(!node.elements.is_empty());
+
+        let mut elems = Vec::new();
+
+        // Compile elements
+        for elem in node.elements.iter() {
+            elems.push(self.build_expr(elem)?.unwrap());
+        }
+
+        let array_ty = Rc::new(Ty {
+            kind: TyKind::Array((node.elements[0].ty.clone(), elems.len() as u32)).into(),
+            mutability: Mutability::Not,
+        });
+
+        let array_llvm_ty = self.conv_to_llvm_type(&array_ty);
+
+        let mallocd = self.gc_malloc(array_llvm_ty)?;
+
+        for (idx, elem) in elems.iter().enumerate() {
+            let gep = unsafe {
+                self.builder.build_in_bounds_gep(
+                    array_llvm_ty,
+                    mallocd,
+                    &[
+                        self.context().i32_type().const_zero(),
+                        self.context().i32_type().const_int(idx as u64, false),
+                    ],
+                    "",
+                )?
+            };
+
+            self.builder.build_store(gep, *elem)?;
+        }
+
+        Ok(Some(mallocd.into()))
+    }
+
+    fn build_array_repeat(&mut self, node: &ArrayRepeat) -> anyhow::Result<Value<'ctx>> {
+        let value = self.build_expr(&node.value)?.unwrap();
+
+        let array_ty = Rc::new(Ty {
+            kind: TyKind::Array((node.value.ty.clone(), node.count)).into(),
+            mutability: Mutability::Not,
+        });
+
+        let array_llvm_ty = self.conv_to_llvm_type(&array_ty);
+
+        let mallocd = self.gc_malloc(array_llvm_ty)?;
+
+        for idx in 0..node.count {
+            let gep = unsafe {
+                self.builder.build_in_bounds_gep(
+                    array_llvm_ty,
+                    mallocd,
+                    &[
+                        self.context().i32_type().const_zero(),
+                        self.context().i32_type().const_int(idx as u64, false),
+                    ],
+                    "",
+                )?
+            };
+
+            self.builder.build_store(gep, value)?;
+        }
+
+        Ok(Some(mallocd.into()))
+    }
+
+    fn build_tuple_literal(&mut self, node: &TupleLiteral) -> anyhow::Result<Value<'ctx>> {
+        let element_values = {
+            let mut v = Vec::new();
+            for e in node.elements.iter() {
+                v.push(self.build_expr(e)?.unwrap());
+            }
+            v
+        };
+
+        let tuple_ty = Ty {
+            kind: TyKind::Tuple(node.elements.iter().map(|e| e.ty.clone()).collect()).into(),
+            mutability: Mutability::Not,
+        };
+
+        let tuple_llvm_ty = self.conv_to_llvm_type(&tuple_ty);
+
+        let value = self.create_gc_struct(tuple_llvm_ty, &element_values)?;
+
+        Ok(Some(value.into()))
+    }
+
+    fn build_cast(&mut self, node: &Cast) -> anyhow::Result<Value<'ctx>> {
+        let value = self.build_expr(&node.operand)?.unwrap();
+
+        let value_ty = node.operand.ty.clone();
+        let target_ty = node.target_ty.clone();
+
+        if value_ty.kind.is_float() || target_ty.kind.is_float() {
+            self.build_float_cast(value, &value_ty, target_ty.clone())
+        } else if value_ty.kind.is_int_or_bool() && target_ty.kind.is_int_or_bool() {
+            self.build_int_cast(value, &value_ty, target_ty.clone())
+        } else if matches!(
+            value_ty.kind.as_ref(),
+            TyKind::Reference(_) | TyKind::Pointer(_)
+        ) && matches!(
+            target_ty.kind.as_ref(),
+            TyKind::Reference(_) | TyKind::Pointer(_)
+        ) {
+            self.build_ptr_cast(value, target_ty.clone())
+        } else {
+            anyhow::bail!(
+                "unsupported cast from `{}` to `{}`",
+                value_ty.kind,
+                target_ty.kind
+            );
+        }
+    }
+
+    fn build_float_cast(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        value_ty: &Rc<Ty>,
+        target_ty: Rc<Ty>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let target_llvm_ty = self.conv_to_llvm_type(&target_ty);
+
+        if value_ty.kind.is_float() && target_ty.kind.is_float() {
+            // float -> float: extend or truncate based on bit width.
+            let src = value.into_float_value();
+            let dst_ty: FloatType<'ctx> = target_llvm_ty.into_float_type();
+            // Both sides are floats (gated above), so `float_bit_width` is `Some`.
+            let widening = value_ty.kind.float_bit_width() < target_ty.kind.float_bit_width();
+            return Ok(Some(if widening {
+                self.builder
+                    .build_float_ext(src, dst_ty, "")?
+                    .as_basic_value_enum()
+            } else {
+                self.builder
+                    .build_float_trunc(src, dst_ty, "")?
+                    .as_basic_value_enum()
+            }));
+        }
+
+        if value_ty.kind.is_int_or_bool() && target_ty.kind.is_float() {
+            // int -> float
+            let src = value.into_int_value();
+            let dst_ty: FloatType<'ctx> = target_llvm_ty.into_float_type();
+            return Ok(Some(if value_ty.kind.is_signed() {
+                self.builder
+                    .build_signed_int_to_float(src, dst_ty, "")?
+                    .as_basic_value_enum()
+            } else {
+                self.builder
+                    .build_unsigned_int_to_float(src, dst_ty, "")?
+                    .as_basic_value_enum()
+            }));
+        }
+
+        if value_ty.kind.is_float() && target_ty.kind.is_int_or_bool() {
+            // float -> int
+            let src = value.into_float_value();
+            let dst_ty = target_llvm_ty.into_int_type();
+            return Ok(Some(if target_ty.kind.is_signed() {
+                self.builder
+                    .build_float_to_signed_int(src, dst_ty, "")?
+                    .as_basic_value_enum()
+            } else {
+                self.builder
+                    .build_float_to_unsigned_int(src, dst_ty, "")?
+                    .as_basic_value_enum()
+            }));
+        }
+
+        anyhow::bail!(
+            "unsupported cast from `{}` to `{}`",
+            value_ty.kind,
+            target_ty.kind
+        );
+    }
+
+    fn build_int_cast(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        value_ty: &Rc<Ty>,
+        target_ty: Rc<Ty>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        assert!(value.is_int_value());
+        assert!(value_ty.kind.is_int_or_bool());
+        assert!(target_ty.kind.is_int_or_bool());
+
+        let target_llvm_ty = self.conv_to_llvm_type(&target_ty);
+
+        Ok(Some(
+            self.builder
+                .build_int_cast_sign_flag(
+                    value.into_int_value(),
+                    target_llvm_ty.into_int_type(),
+                    value_ty.kind.is_signed(),
+                    "",
+                )?
+                .as_basic_value_enum(),
+        ))
+    }
+
+    fn build_ptr_cast(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        target_ty: Rc<Ty>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let target_llvm_ty = self.conv_to_llvm_type(&target_ty);
+
+        Ok(Some(
+            self.builder
+                .build_pointer_cast(
+                    value.into_pointer_value(),
+                    target_llvm_ty.into_pointer_type(),
+                    "",
+                )?
+                .as_basic_value_enum(),
+        ))
+    }
+
+    // Build indexing for array and pointer and str
+    fn build_indexing(&mut self, node: &Indexing) -> anyhow::Result<Value<'ctx>> {
+        // A raw array cannot be passed, but a pointer(reference) to an array
+        let ref_value = self.build_expr(&node.operand)?.unwrap();
+
+        let refee_ty = match node.operand.ty.kind.as_ref() {
+            TyKind::Reference(rty) => rty.get_base_type(),
+            TyKind::Pointer(pty) => return self.build_pointer_indexing(node, ref_value, pty),
+            _ => unreachable!(),
+        };
+
+        match refee_ty.kind.as_ref() {
+            TyKind::Array(_) => {
+                let array_llvm_ty = self.conv_to_llvm_type(&refee_ty).into_array_type();
+
+                let ptr_to_array = ref_value.into_pointer_value();
+
+                let index = self.build_expr(&node.index)?.unwrap();
+
+                // Calculate the address of the index-th element
+                let gep = unsafe {
+                    self.builder.build_in_bounds_gep(
+                        array_llvm_ty,
+                        ptr_to_array,
+                        &[
+                            self.context().i32_type().const_zero(),
+                            index.into_int_value(),
+                        ],
+                        "",
+                    )?
+                };
+
+                return Ok(Some(self.builder.build_load(
+                    array_llvm_ty.get_element_type(),
+                    gep,
+                    "",
+                )?));
+            }
+            TyKind::Slice(_) => {
+                return self.build_slice_indexing(node, ref_value, refee_ty);
+            }
+            TyKind::Fundamental(FundamentalType {
+                kind: FundamentalTypeKind::Str,
+                ..
+            }) => {
+                return self.build_string_indexing(node);
+            }
+            _ => {}
+        }
+
+        todo!("Error")
+    }
+
+    fn build_slicing(&mut self, node: &Slicing) -> anyhow::Result<Value<'ctx>> {
+        let operand_value = self.build_expr(&node.operand)?.unwrap();
+        let operand_ty = node.operand.ty.clone();
+
+        let start_val = self.build_expr(&node.start)?.unwrap().into_int_value();
+        let end_val = self.build_expr(&node.end)?.unwrap().into_int_value();
+
+        let start_i64 = self
+            .builder
+            .build_int_cast(start_val, self.context().i64_type(), "")?;
+        let end_i64 = self
+            .builder
+            .build_int_cast(end_val, self.context().i64_type(), "")?;
+
+        let elem_llvm_ty = self.conv_to_llvm_type(&node.elem_ty);
+
+        let data_ptr = match operand_ty.kind.as_ref() {
+            TyKind::Reference(rty) => match rty.get_base_type().kind.as_ref() {
+                TyKind::Array(_) => {
+                    let array_llvm_ty = self
+                        .conv_to_llvm_type(&rty.get_base_type())
+                        .into_array_type();
+                    let start_i32 =
+                        self.builder
+                            .build_int_cast(start_i64, self.context().i32_type(), "")?;
+
+                    unsafe {
+                        self.builder.build_in_bounds_gep(
+                            array_llvm_ty,
+                            operand_value.into_pointer_value(),
+                            &[self.context().i32_type().const_zero(), start_i32],
+                            "",
+                        )?
+                    }
+                }
+                TyKind::Slice(_) => {
+                    let slice_llvm_ty = self
+                        .conv_to_llvm_type(&rty.get_base_type())
+                        .into_struct_type();
+
+                    let data_gep = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            slice_llvm_ty,
+                            operand_value.into_pointer_value(),
+                            &[
+                                self.context().i32_type().const_zero(),
+                                self.context().i32_type().const_zero(),
+                            ],
+                            "",
+                        )?
+                    };
+
+                    let data_ptr = self.builder.build_load(
+                        slice_llvm_ty.get_field_type_at_index(0).unwrap(),
+                        data_gep,
+                        "",
+                    )?;
+
+                    unsafe {
+                        self.builder.build_in_bounds_gep(
+                            elem_llvm_ty,
+                            data_ptr.into_pointer_value(),
+                            &[start_i64],
+                            "",
+                        )?
+                    }
+                }
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+
+        let len_value = self
+            .builder
+            .build_int_sub(end_i64, start_i64, "")?
+            .as_basic_value_enum();
+
+        let slice_ty = Ty {
+            kind: TyKind::Slice(node.elem_ty.clone()).into(),
+            mutability: Mutability::Not,
+        };
+        let slice_llvm_ty = self.conv_to_llvm_type(&slice_ty);
+
+        let slice_ptr =
+            self.create_gc_struct(slice_llvm_ty, &[data_ptr.as_basic_value_enum(), len_value])?;
+
+        Ok(Some(slice_ptr.as_basic_value_enum()))
+    }
+
+    fn build_pointer_indexing(
+        &mut self,
+        node: &Indexing,
+        ptr_value: BasicValueEnum<'ctx>,
+        pty: &PointerType,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let pointee_llvm_ty = self.conv_to_llvm_type(&pty.pointee_ty);
+
+        let index = self.build_expr(&node.index)?.unwrap();
+
+        let gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                pointee_llvm_ty,
+                ptr_value.into_pointer_value(),
+                &[index.into_int_value()],
+                "",
+            )?
+        };
+
+        Ok(Some(self.builder.build_load(pointee_llvm_ty, gep, "")?))
+    }
+
+    fn build_slice_indexing(
+        &mut self,
+        node: &Indexing,
+        slice_value: BasicValueEnum<'ctx>,
+        slice_ty: Rc<Ty>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let slice_llvm_ty = self.conv_to_llvm_type(&slice_ty).into_struct_type();
+
+        let data_gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                slice_llvm_ty,
+                slice_value.into_pointer_value(),
+                &[
+                    self.context().i32_type().const_zero(),
+                    self.context().i32_type().const_zero(),
+                ],
+                "",
+            )?
+        };
+
+        let data_ptr = self.builder.build_load(
+            slice_llvm_ty.get_field_type_at_index(0).unwrap(),
+            data_gep,
+            "",
+        )?;
+
+        let index = self.build_expr(&node.index)?.unwrap();
+        let elem_ty = match slice_ty.kind.as_ref() {
+            TyKind::Slice(elem_ty) => elem_ty.clone(),
+            _ => unreachable!(),
+        };
+        let elem_llvm_ty = self.conv_to_llvm_type(&elem_ty);
+
+        let elem_gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                elem_llvm_ty,
+                data_ptr.into_pointer_value(),
+                &[index.into_int_value()],
+                "",
+            )?
+        };
+
+        Ok(Some(
+            self.builder
+                .build_load(elem_llvm_ty, elem_gep, "")?
+                .as_basic_value_enum(),
+        ))
+    }
+
+    fn build_string_indexing(&mut self, node: &Indexing) -> anyhow::Result<Value<'ctx>> {
+        let string_ref_value = self.build_expr(&node.operand)?.unwrap();
+        let index = self.build_expr(&node.index)?.unwrap().into_int_value();
+        let index = if index.get_type() == self.context().i64_type() {
+            index
+        } else {
+            self.builder
+                .build_int_cast(index, self.context().i64_type(), "")?
+        };
+
+        let str_llvm_ty = FundamentalType::create_llvm_str_type(self.context()).into_struct_type();
+        let (data_ptr, data_len) = self.load_str_ptr_and_len(string_ref_value, str_llvm_ty)?;
+        let utf8_char_at_fn = self.utf8_char_at_fn(str_llvm_ty);
+        let result = self.builder.build_call(
+            utf8_char_at_fn,
+            &[data_ptr.into(), data_len.into(), index.into()],
+            "",
+        )?;
+
+        Ok(Some(result.try_as_basic_value().left().unwrap()))
+    }
+
+    fn build_arithmetic_binary(&mut self, node: &Binary) -> anyhow::Result<Value<'ctx>> {
+        use BinaryKind::*;
+
+        let left_ty = node.lhs.ty.clone();
+        let right_ty = node.rhs.ty.clone();
+
+        let left = self.build_expr(&node.lhs)?.unwrap();
+        let right = self.build_expr(&node.rhs)?.unwrap();
+
+        if left_ty.is_str() && right_ty.is_str() {
+            return match node.kind {
+                Eq => self.build_str_equal(left, right),
+                Ne => self.build_str_not_equal(left, right),
+                _ => anyhow::bail!("unsupported operation for str type: {:?}", node.kind),
+            };
+        }
+
+        if left_ty.is_enum() && right_ty.is_enum() {
+            let left_tag = self.load_enum_discriminant(left, &left_ty)?;
+            let right_tag = self.load_enum_discriminant(right, &right_ty)?;
+
+            return Ok(match node.kind {
+                Eq => Some(
+                    self.builder
+                        .build_int_compare(IntPredicate::EQ, left_tag, right_tag, "")?
+                        .into(),
+                ),
+                Ne => Some(
+                    self.builder
+                        .build_int_compare(IntPredicate::NE, left_tag, right_tag, "")?
+                        .into(),
+                ),
+                _ => anyhow::bail!("unsupported enum operation: {:?}", node.kind),
+            });
+        }
+
+        if left_ty.kind.is_float() && right_ty.kind.is_float() {
+            return self.build_float_arithmetic_binary(
+                node.kind,
+                left.into_float_value(),
+                right.into_float_value(),
+            );
+        }
+
+        // If operands are not int
+        if !(left.is_int_value() && right.is_int_value()) {
+            anyhow::bail!(
+                "unsupported non-integer operands for binary operation: {:?}",
+                node.kind
+            );
+        }
+
+        let left_int = left.into_int_value();
+        let right_int = right.into_int_value();
+
+        Ok(match node.kind {
+            LogicalOr => self.build_logical_or(left_int, right_int)?,
+
+            LogicalAnd => self.build_logical_and(left_int, right_int)?,
+
+            BitAnd => Some(self.builder.build_and(left_int, right_int, "")?.into()),
+
+            BitOr => Some(self.builder.build_or(left_int, right_int, "")?.into()),
+
+            BitXor => Some(self.builder.build_xor(left_int, right_int, "")?.into()),
+
+            Shl => Some(
+                self.builder
+                    .build_left_shift(left_int, right_int, "")?
+                    .into(),
+            ),
+
+            Shr => Some(
+                self.builder
+                    .build_right_shift(left_int, right_int, left_ty.kind.is_signed(), "")?
+                    .into(),
+            ),
+
+            Add => Some(self.builder.build_int_add(left_int, right_int, "")?.into()),
+
+            Sub => Some(self.builder.build_int_sub(left_int, right_int, "")?.into()),
+
+            Mul => Some(self.builder.build_int_mul(left_int, right_int, "")?.into()),
+
+            Rem => {
+                if left_ty.kind.is_signed() || right_ty.kind.is_signed() {
+                    Some(
+                        self.builder
+                            .build_int_signed_rem(left_int, right_int, "")?
+                            .into(),
+                    )
+                } else {
+                    Some(
+                        self.builder
+                            .build_int_unsigned_rem(left_int, right_int, "")?
+                            .into(),
+                    )
+                }
+            }
+
+            Div => {
+                if left_ty.kind.is_signed() || right_ty.kind.is_signed() {
+                    Some(
+                        self.builder
+                            .build_int_signed_div(left_int, right_int, "")?
+                            .into(),
+                    )
+                } else {
+                    Some(
+                        self.builder
+                            .build_int_unsigned_div(left_int, right_int, "")?
+                            .into(),
+                    )
+                }
+            }
+
+            Eq => self.build_int_equal(left_int, right_int)?,
+
+            Ne => Some(
+                self.builder
+                    .build_int_compare(IntPredicate::NE, left_int, right_int, "")?
+                    .into(),
+            ),
+
+            Lt => {
+                if left_ty.kind.is_signed() || right_ty.kind.is_signed() {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::SLT, left_int, right_int, "")?
+                            .into(),
+                    )
+                } else {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::ULT, left_int, right_int, "")?
+                            .into(),
+                    )
+                }
+            }
+
+            Le => {
+                if left_ty.kind.is_signed() || right_ty.kind.is_signed() {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::SLE, left_int, right_int, "")?
+                            .into(),
+                    )
+                } else {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::ULE, left_int, right_int, "")?
+                            .into(),
+                    )
+                }
+            }
+
+            Gt => {
+                if left_ty.kind.is_signed() || right_ty.kind.is_signed() {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::SGT, left_int, right_int, "")?
+                            .into(),
+                    )
+                } else {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::UGT, left_int, right_int, "")?
+                            .into(),
+                    )
+                }
+            }
+
+            Ge => {
+                if left_ty.kind.is_signed() || right_ty.kind.is_signed() {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::SGE, left_int, right_int, "")?
+                            .into(),
+                    )
+                } else {
+                    Some(
+                        self.builder
+                            .build_int_compare(IntPredicate::UGE, left_int, right_int, "")?
+                            .into(),
+                    )
+                }
+            }
+        })
+    }
+
+    fn build_float_arithmetic_binary(
+        &mut self,
+        op: BinaryKind,
+        left: inkwell::values::FloatValue<'ctx>,
+        right: inkwell::values::FloatValue<'ctx>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        use BinaryKind::*;
+
+        Ok(match op {
+            Add => Some(self.builder.build_float_add(left, right, "")?.into()),
+            Sub => Some(self.builder.build_float_sub(left, right, "")?.into()),
+            Mul => Some(self.builder.build_float_mul(left, right, "")?.into()),
+            Div => Some(self.builder.build_float_div(left, right, "")?.into()),
+            Rem => Some(self.builder.build_float_rem(left, right, "")?.into()),
+
+            Eq => Some(
+                self.builder
+                    .build_float_compare(FloatPredicate::OEQ, left, right, "")?
+                    .into(),
+            ),
+            Ne => Some(
+                self.builder
+                    .build_float_compare(FloatPredicate::ONE, left, right, "")?
+                    .into(),
+            ),
+            Lt => Some(
+                self.builder
+                    .build_float_compare(FloatPredicate::OLT, left, right, "")?
+                    .into(),
+            ),
+            Le => Some(
+                self.builder
+                    .build_float_compare(FloatPredicate::OLE, left, right, "")?
+                    .into(),
+            ),
+            Gt => Some(
+                self.builder
+                    .build_float_compare(FloatPredicate::OGT, left, right, "")?
+                    .into(),
+            ),
+            Ge => Some(
+                self.builder
+                    .build_float_compare(FloatPredicate::OGE, left, right, "")?
+                    .into(),
+            ),
+
+            LogicalOr | LogicalAnd | BitAnd | BitOr | BitXor | Shl | Shr => {
+                anyhow::bail!("unsupported operation for float type: {:?}", op);
+            }
+        })
+    }
+
+    fn load_enum_discriminant(
+        &mut self,
+        enum_value: BasicValueEnum<'ctx>,
+        enum_ty: &Rc<Ty>,
+    ) -> anyhow::Result<IntValue<'ctx>> {
+        if !enum_value.is_pointer_value() {
+            anyhow::bail!("expected enum value to be a pointer");
+        }
+
+        let enum_base_ty = match enum_ty.kind.as_ref() {
+            TyKind::Reference(rty) => rty.get_base_type(),
+            _ => enum_ty.clone(),
+        };
+        let enum_struct_ty = self.conv_to_llvm_type(&enum_base_ty).into_struct_type();
+        let enum_ptr = enum_value.into_pointer_value();
+
+        let tag_gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                enum_struct_ty,
+                enum_ptr,
+                &[
+                    self.context().i32_type().const_zero(),
+                    self.context().i32_type().const_zero(),
+                ],
+                "",
+            )?
+        };
+
+        let tag = self
+            .builder
+            .build_load(self.context().i32_type(), tag_gep, "")?;
+
+        Ok(tag.into_int_value())
+    }
+
+    fn build_str_equal(
+        &mut self,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let cmp = self.build_strcmp(left, right)?;
+        let zero = self.context().i32_type().const_zero();
+
+        Ok(Some(
+            self.builder
+                .build_int_compare(IntPredicate::EQ, cmp, zero, "")?
+                .into(),
+        ))
+    }
+
+    fn build_str_not_equal(
+        &mut self,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let cmp = self.build_strcmp(left, right)?;
+        let zero = self.context().i32_type().const_zero();
+
+        Ok(Some(
+            self.builder
+                .build_int_compare(IntPredicate::NE, cmp, zero, "")?
+                .into(),
+        ))
+    }
+
+    fn build_strcmp(
+        &mut self,
+        left: BasicValueEnum<'ctx>,
+        right: BasicValueEnum<'ctx>,
+    ) -> anyhow::Result<IntValue<'ctx>> {
+        let str_llvm_ty = FundamentalType::create_llvm_str_type(self.context()).into_struct_type();
+
+        let (left_ptr, left_len) = self.load_str_ptr_and_len(left, str_llvm_ty)?;
+        let (right_ptr, right_len) = self.load_str_ptr_and_len(right, str_llvm_ty)?;
+
+        let strcmp_fn = match self.module.get_function("kaede_strcmp") {
+            Some(f) => f,
+            None => {
+                let ptr_ty = str_llvm_ty.get_field_type_at_index(0).unwrap();
+                let len_ty = str_llvm_ty.get_field_type_at_index(1).unwrap();
+
+                let fn_type = self.context().i32_type().fn_type(
+                    &[ptr_ty.into(), len_ty.into(), ptr_ty.into(), len_ty.into()],
+                    false,
+                );
+
+                self.module
+                    .add_function("kaede_strcmp", fn_type, Some(Linkage::External))
+            }
+        };
+
+        let cmp = self.builder.build_call(
+            strcmp_fn,
+            &[
+                left_ptr.into(),
+                left_len.into(),
+                right_ptr.into(),
+                right_len.into(),
+            ],
+            "",
+        )?;
+
+        Ok(cmp.try_as_basic_value().left().unwrap().into_int_value())
+    }
+
+    fn utf8_char_at_fn(&mut self, str_llvm_ty: StructType<'ctx>) -> FunctionValue<'ctx> {
+        match self.module.get_function("kaede_utf8_char_at") {
+            Some(f) => f,
+            None => {
+                let ptr_ty = str_llvm_ty.get_field_type_at_index(0).unwrap();
+                let len_ty = str_llvm_ty.get_field_type_at_index(1).unwrap();
+                let fn_type = self
+                    .context()
+                    .i32_type()
+                    .fn_type(&[ptr_ty.into(), len_ty.into(), len_ty.into()], false);
+
+                self.module
+                    .add_function("kaede_utf8_char_at", fn_type, Some(Linkage::External))
+            }
+        }
+    }
+
+    fn load_str_ptr_and_len(
+        &mut self,
+        str_value: BasicValueEnum<'ctx>,
+        str_llvm_ty: StructType<'ctx>,
+    ) -> anyhow::Result<(PointerValue<'ctx>, IntValue<'ctx>)> {
+        let str_ptr = str_value.into_pointer_value();
+        let zero = self.context().i32_type().const_zero();
+        let one = self.context().i32_type().const_int(1, false);
+
+        let data_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(str_llvm_ty, str_ptr, &[zero, zero], "")?
+        };
+        let data_ptr = self.builder.build_load(
+            str_llvm_ty.get_field_type_at_index(0).unwrap(),
+            data_gep,
+            "",
+        )?;
+
+        let len_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(str_llvm_ty, str_ptr, &[zero, one], "")?
+        };
+        let len = self.builder.build_load(
+            str_llvm_ty.get_field_type_at_index(1).unwrap(),
+            len_gep,
+            "",
+        )?;
+
+        Ok((data_ptr.into_pointer_value(), len.into_int_value()))
+    }
+
+    fn build_logical_or(
+        &self,
+        b1: IntValue<'ctx>,
+        b2: IntValue<'ctx>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let bool_type = self.context().bool_type();
+
+        let result = self.builder.build_or(b1, b2, "")?;
+
+        let zero = bool_type.const_zero();
+        let cmp = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::EQ, result, zero, "")?;
+        let result = self
+            .builder
+            .build_select(cmp, zero, bool_type.const_all_ones(), "")?;
+
+        Ok(Some(result))
+    }
+
+    fn build_logical_and(
+        &self,
+        b1: IntValue<'ctx>,
+        b2: IntValue<'ctx>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let bool_type = self.context().bool_type();
+
+        let result = self.builder.build_and(b1, b2, "")?;
+
+        let zero = bool_type.const_zero();
+        let cmp = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::EQ, result, zero, "")?;
+        let result = self
+            .builder
+            .build_select(cmp, zero, bool_type.const_all_ones(), "")?;
+
+        Ok(Some(result))
+    }
+
+    fn build_int_equal(
+        &self,
+        left: IntValue<'ctx>,
+        right: IntValue<'ctx>,
+    ) -> anyhow::Result<Value<'ctx>> {
+        Ok(Some(
+            self.builder
+                .build_int_compare(IntPredicate::EQ, left, right, "")?
+                .into(),
+        ))
+    }
+
+    fn build_field_access(&mut self, node: &FieldAccess) -> anyhow::Result<Value<'ctx>> {
+        let llvm_struct_ty = self
+            .module
+            .get_struct_type(node.struct_info.name.mangle().as_str())
+            .unwrap();
+
+        let struct_value = self.build_expr(&node.operand)?.unwrap();
+
+        let gep = unsafe {
+            self.builder.build_in_bounds_gep(
+                llvm_struct_ty,
+                struct_value.into_pointer_value(),
+                &[
+                    self.context().i32_type().const_zero(),
+                    self.context()
+                        .i32_type()
+                        .const_int(node.field_offset, false),
+                ],
+                "",
+            )?
+        };
+
+        let field_ty = node.struct_info.fields[node.field_offset as usize]
+            .ty
+            .clone();
+
+        let llvm_field_ty = self.conv_to_llvm_type(&field_ty);
+
+        Ok(Some(self.builder.build_load(llvm_field_ty, gep, "")?))
+    }
+
+    fn build_tuple_indexing(&mut self, node: &TupleIndexing) -> anyhow::Result<Value<'ctx>> {
+        self.build_tuple_indexing_internal(node)
+    }
+
+    fn build_tuple_indexing_internal(
+        &mut self,
+        node: &TupleIndexing,
+    ) -> anyhow::Result<Value<'ctx>> {
+        let tuple = self.build_expr(&node.tuple)?.unwrap();
+
+        self.build_indexing_common(
+            tuple.into_pointer_value(),
+            node.tuple.ty.clone(),
+            node.element_ty.clone(),
+            // Tuple is wrapped in a pointer (Generated from GC).
+            // So, number of indexes is 2.
+            &[
+                self.context().i32_type().const_zero(),
+                self.context()
+                    .i32_type()
+                    .const_int(node.index as u64, false),
+            ],
+        )
+    }
+
+    pub fn build_indexing_common(
+        &mut self,
+        ptr: PointerValue<'ctx>,
+        ptr_ty: Rc<Ty>,
+        element_ty: Rc<Ty>,
+        ordered_indexes: &[IntValue<'ctx>],
+    ) -> anyhow::Result<Value<'ctx>> {
+        let pointee_ty = if let TyKind::Reference(rty) = ptr_ty.kind.as_ref() {
+            rty.refee_ty.clone()
+        } else {
+            unreachable!()
+        };
+
+        let llvm_pointee_ty = self.conv_to_llvm_type(&pointee_ty);
+
+        let llvm_element_ty = self.conv_to_llvm_type(&element_ty);
+
+        let gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(llvm_pointee_ty, ptr, ordered_indexes, "")?
+        };
+
+        Ok(Some(self.builder.build_load(llvm_element_ty, gep, "")?))
+    }
+
+    fn build_enum_variant(&mut self, node: &EnumVariant) -> anyhow::Result<Value<'ctx>> {
+        let enum_llvm_ty = self
+            .module
+            .get_struct_type(node.enum_info.name.mangle().as_str())
+            .unwrap();
+
+        let offset_in_llvm = self
+            .context()
+            .i32_type()
+            .const_int(node.variant_offset as u64, false)
+            .into();
+
+        let init_values = match &node.value {
+            Some(v) => vec![offset_in_llvm, self.build_expr(v)?.unwrap()],
+            None => vec![offset_in_llvm],
+        };
+
+        Ok(Some(
+            self.create_gc_struct(enum_llvm_ty.as_basic_type_enum(), &init_values)?
+                .into(),
+        ))
+    }
+}

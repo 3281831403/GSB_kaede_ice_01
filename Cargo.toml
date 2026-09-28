@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "compiler/ast",
+  "compiler/ast_type",
+  "compiler/codegen",
+  "compiler/driver",
+  "compiler/lex",
+  "compiler/parse",
+  "compiler/span",
+  "compiler/symbol",
+  "compiler/common",
+  "compiler/ir",
+  "compiler/lsp",
+  "compiler/semantic",
+  "compiler/monomorphize",
+  "compiler/type_infer",
+  "compiler/symbol_table",
+]
+resolver = "2"

@@ -1,0 +1,551 @@
+import std.cmp
+import std.assert
+import std.collections
+import std.option
+import std.result
+import db
+
+use std.cmp.Ordering
+use std.assert.assert
+use std.collections.HashMap
+use std.option.Option
+use std.result.Result
+use db.*
+
+fun append_test_kv(node: mut BNode, idx: u16, val_len: u64) {
+    append_test_kv_with_key(node, idx, idx as u8, val_len)
+}
+
+fun append_test_kv_with_key(node: mut BNode, idx: u16, key_num: u8, val_len: u64) {
+    mut key := [0 as u8; 2]
+    key[1] = key_num
+
+    val := Vector<u8>::filled(val_len, key_num)
+    node.append_kv(idx, 0, key[:], val.as_slice())
+}
+
+fun make_test_leaf(nkeys: u16, val_len: u64) -> mut BNode {
+    mut node := BNode::new(2 * BTREE_PAGE_SIZE)
+    node.set_header(BTREE_NODE_TYPE_LEAF, nkeys)
+
+    mut i := 0
+    while i < nkeys {
+        append_test_kv(node, i, val_len)
+        i += 1
+    }
+
+    return node
+}
+
+fun make_test_leaf_from(first_key: u8, nkeys: u16, val_len: u64) -> mut BNode {
+    mut node := BNode::new(2 * BTREE_PAGE_SIZE)
+    node.set_header(BTREE_NODE_TYPE_LEAF, nkeys)
+
+    mut i := 0
+    while i < nkeys {
+        append_test_kv_with_key(node, i, first_key + (i as u8), val_len)
+        i += 1
+    }
+
+    return node
+}
+
+fun make_test_leaf_with_big_middle() -> mut BNode {
+    mut node := BNode::new(2 * BTREE_PAGE_SIZE)
+    node.set_header(BTREE_NODE_TYPE_LEAF, 5)
+
+    append_test_kv(node, 0, 100)
+    append_test_kv(node, 1, 100)
+
+    mut big_key := Vector<u8>::filled(BTREE_MAX_KEY_SIZE, 0)
+    big_key.as_mut_slice()[1] = 2
+    big_val := Vector<u8>::filled(BTREE_MAX_VAL_SIZE, 7)
+    node.append_kv(2, 0, big_key.as_slice(), big_val.as_slice())
+
+    append_test_kv(node, 3, 100)
+    append_test_kv(node, 4, 100)
+
+    return node
+}
+
+fun make_test_leaf_with_sentinel() -> mut BNode {
+    mut node := BNode::new(2 * BTREE_PAGE_SIZE)
+    node.set_header(BTREE_NODE_TYPE_LEAF, 2)
+
+    key1 := make_test_key(1)
+    node.append_kv(0, 0, b"", b"")
+    node.append_kv(1, 0, key1[:], b"v1")
+    return node
+}
+
+fun make_test_key(n: u8) -> [u8; 2] {
+    mut key := [0 as u8; 2]
+    key[1] = n
+    return key
+}
+
+fun append_test_child(node: mut BNode, idx: u16, ptr: u64, key_num: u8) {
+    key := make_test_key(key_num)
+    node.append_kv(idx, ptr, key[:], b"")
+}
+
+fun dummy_tree() -> BTree {
+    return BTree {
+        root: 0,
+        get: |ptr| {
+            panic("dummy_tree.get should not be called")
+            return b""
+        },
+        new: |node| {
+            panic("dummy_tree.new should not be called")
+            return 0
+        },
+        del: |ptr| {
+            panic("dummy_tree.del should not be called")
+        },
+    }
+}
+
+fun child_replacement_tree() -> BTree {
+    return BTree {
+        root: 0,
+        get: |ptr| {
+            assert(ptr == 7 as u64, "tree_insert internal test: unexpected child pointer")
+            child := make_test_leaf_with_sentinel()
+            return child.data.as_slice()
+        },
+        new: |node| {
+            assert(BNode::from_slice(node).nbytes() <= BTREE_PAGE_SIZE, "tree_insert internal test: allocated node exceeds page size")
+            return 99 as u64
+        },
+        del: |ptr| {
+            assert(ptr == 7 as u64, "tree_insert internal test: unexpected deleted pointer")
+        },
+    }
+}
+
+struct TestPageStore {
+    pages: HashMap<u64, BNode>,
+    next_ptr: u64,
+}
+
+impl TestPageStore {
+    fun new() -> mut TestPageStore {
+        return TestPageStore {
+            pages: HashMap<u64, BNode>::new(),
+            next_ptr: 1,
+        }
+    }
+
+    fun get(self, ptr: u64) -> [u8] {
+        node := match self.pages.get(ptr) {
+            Option::Some(node) => node,
+            Option::None => {
+                panic("page_get: unknown page")
+                BNode::new(BTREE_PAGE_SIZE)
+            },
+        }
+        return node.data.as_slice()
+    }
+
+    fun alloc(mut self, node: [u8]) -> u64 {
+        assert(BNode::from_slice(node).nbytes() <= BTREE_PAGE_SIZE, "page_alloc: node exceeds page size")
+
+        ptr := self.next_ptr
+        self.next_ptr += 1
+        self.pages.insert(ptr, BNode::from_slice(node))
+        return ptr
+    }
+
+    fun del(mut self, ptr: u64) {
+        match self.pages.remove(ptr) {
+            Option::Some(_) => {},
+            Option::None => panic("page_del: unknown page"),
+        }
+    }
+}
+
+// Simulates the page-management callbacks from the textbook so the B-tree can
+// be tested without a file-backed page store.
+fun new_memory_tree() -> mut BTree {
+    mut store := TestPageStore::new()
+
+    return BTree {
+        root: 0,
+        get: |ptr| store.get(ptr),
+        new: |node| store.alloc(node),
+        del: |ptr| store.del(ptr),
+    }
+}
+
+fun load_node(tree: BTree, ptr: u64) -> BNode {
+    return BNode::from_slice((tree.get)(ptr))
+}
+
+// Test-only lookup for walking stored pages without exporting node_lookup_le.
+fun lookup_le_for_test(node: BNode, key: [u8]) -> u16 {
+    nkeys := node.nkeys()
+
+    mut i := 0
+    while i < nkeys {
+        cmp := node.get_key(i).compare(key)
+        match cmp {
+            Ordering::Equal => return i,
+            Ordering::Greater => return i - 1,
+            _ => {
+                i += 1
+            }
+        }
+    }
+
+    return i - 1
+}
+
+fun find_stored_value(tree: BTree, key: [u8]) -> [u8] {
+    mut ptr := tree.root
+
+    while ptr != 0 {
+        node := load_node(tree, ptr)
+        idx := lookup_le_for_test(node, key)
+
+        match node.btype() {
+            BTREE_NODE_TYPE_NODE => {
+                ptr = node.get_ptr(idx)
+            },
+            BTREE_NODE_TYPE_LEAF => {
+                assert(node.get_key(idx).compare(key) == Ordering::Equal, "find_stored_value: key not found")
+                return node.get_val(idx)
+            },
+            _ => panic("find_stored_value: unknown node type"),
+        }
+    }
+
+    panic("find_stored_value: empty tree")
+    return b""
+}
+
+fun assert_ok(result: Result<bool, BTreeError>, msg: str) {
+    match result {
+        Result::Ok(ok) => {
+            assert(ok, msg)
+        },
+        Result::Err(_) => panic(msg),
+    }
+}
+
+fun assert_btree_error(result: Result<bool, BTreeError>, expected: BTreeError, msg: str) {
+    match result {
+        Result::Ok(_) => panic(msg),
+        Result::Err(err) => {
+            assert(err == expected, msg)
+        },
+    }
+}
+
+fun assert_page_sized(node: BNode, msg: str) {
+    assert(node.nbytes() <= BTREE_PAGE_SIZE, msg)
+}
+
+fun test_node_split3_single_page() {
+    node := make_test_leaf(3, 8)
+    let (nsplit, split) = node_split3(node)
+
+    assert(nsplit == 1, "node_split3 single-page test: expected one node")
+    assert(split[0].nkeys() == node.nkeys(), "node_split3 single-page test: key count changed")
+    assert(split[0].get_key(0).compare(node.get_key(0)) == Ordering::Equal, "node_split3 single-page test: first key changed")
+    assert_page_sized(split[0], "node_split3 single-page test: node exceeds page size")
+}
+
+fun test_node_split3_two_pages() {
+    node := make_test_leaf(80, 48)
+    let (nsplit, split) = node_split3(node)
+
+    assert(node.nbytes() > BTREE_PAGE_SIZE, "node_split3 two-page test: fixture did not exceed one page")
+    assert(nsplit == 2, "node_split3 two-page test: expected two nodes")
+    assert(split[0].nkeys() + split[1].nkeys() == node.nkeys(), "node_split3 two-page test: key count changed")
+    assert_page_sized(split[0], "node_split3 two-page test: left exceeds page size")
+    assert_page_sized(split[1], "node_split3 two-page test: right exceeds page size")
+}
+
+fun test_node_split3_three_pages() {
+    node := make_test_leaf_with_big_middle()
+    let (nsplit, split) = node_split3(node)
+
+    assert(node.nbytes() > BTREE_PAGE_SIZE, "node_split3 three-page test: fixture did not exceed one page")
+    assert(nsplit == 3, "node_split3 three-page test: expected three nodes")
+    assert(split[0].nkeys() + split[1].nkeys() + split[2].nkeys() == node.nkeys(), "node_split3 three-page test: key count changed")
+    assert_page_sized(split[0], "node_split3 three-page test: left exceeds page size")
+    assert_page_sized(split[1], "node_split3 three-page test: middle exceeds page size")
+    assert_page_sized(split[2], "node_split3 three-page test: right exceeds page size")
+}
+
+fun test_node_split3() {
+    test_node_split3_single_page()
+    test_node_split3_two_pages()
+    test_node_split3_three_pages()
+}
+
+fun test_tree_insert_leaf_insert_and_update() {
+    tree := dummy_tree()
+    leaf := make_test_leaf(2, 4)
+
+    key2 := make_test_key(2)
+    inserted := tree_insert(tree, leaf, key2[:], b"zz")
+    assert(inserted.btype() == BTREE_NODE_TYPE_LEAF, "tree_insert leaf insert test: expected leaf")
+    assert(inserted.nkeys() == 3, "tree_insert leaf insert test: expected one new key")
+    assert(inserted.get_key(2).compare(key2[:]) == Ordering::Equal, "tree_insert leaf insert test: key not inserted")
+    assert(inserted.get_val(2).compare(b"zz") == Ordering::Equal, "tree_insert leaf insert test: value not inserted")
+
+    key1 := make_test_key(1)
+    updated := tree_insert(tree, leaf, key1[:], b"replacement")
+    assert(updated.nkeys() == 2, "tree_insert leaf update test: key count changed")
+    assert(updated.get_key(1).compare(key1[:]) == Ordering::Equal, "tree_insert leaf update test: key changed")
+    assert(updated.get_val(1).compare(b"replacement") == Ordering::Equal, "tree_insert leaf update test: value not updated")
+}
+
+fun test_tree_insert_internal_replaces_child() {
+    tree := child_replacement_tree()
+    mut parent := BNode::new(2 * BTREE_PAGE_SIZE)
+    parent.set_header(BTREE_NODE_TYPE_NODE, 1)
+    parent.append_kv(0, 7, b"", b"")
+
+    key2 := make_test_key(2)
+    updated := tree_insert(tree, parent, key2[:], b"vv")
+
+    assert(updated.btype() == BTREE_NODE_TYPE_NODE, "tree_insert internal test: expected internal node")
+    assert(updated.nkeys() == 1, "tree_insert internal test: parent key count changed")
+    assert(updated.get_ptr(0) == 99, "tree_insert internal test: child pointer was not replaced")
+    assert(updated.get_key(0).compare(b"") == Ordering::Equal, "tree_insert internal test: child range key changed")
+}
+
+fun test_tree_insert() {
+    test_tree_insert_leaf_insert_and_update()
+    test_tree_insert_internal_replaces_child()
+}
+
+fun test_leaf_delete_removes_middle_key() {
+    leaf := make_test_leaf(4, 4)
+    mut deleted := BNode::new(BTREE_PAGE_SIZE)
+    leaf_delete(deleted, leaf, 2)
+
+    key0 := make_test_key(0)
+    key1 := make_test_key(1)
+    key3 := make_test_key(3)
+
+    assert(deleted.btype() == BTREE_NODE_TYPE_LEAF, "leaf_delete middle test: expected leaf")
+    assert(deleted.nkeys() == 3, "leaf_delete middle test: key count changed incorrectly")
+    assert(deleted.get_key(0).compare(key0[:]) == Ordering::Equal, "leaf_delete middle test: first key changed")
+    assert(deleted.get_key(1).compare(key1[:]) == Ordering::Equal, "leaf_delete middle test: second key changed")
+    assert(deleted.get_key(2).compare(key3[:]) == Ordering::Equal, "leaf_delete middle test: deleted key was not removed")
+    assert(deleted.get_val(2)[0] == 3 as u8, "leaf_delete middle test: value shifted incorrectly")
+}
+
+fun test_leaf_delete_removes_edge_keys() {
+    leaf := make_test_leaf(4, 4)
+
+    mut without_first := BNode::new(BTREE_PAGE_SIZE)
+    leaf_delete(without_first, leaf, 0)
+
+    key1 := make_test_key(1)
+    key3 := make_test_key(3)
+    assert(without_first.nkeys() == 3, "leaf_delete edge test: first delete count changed incorrectly")
+    assert(without_first.get_key(0).compare(key1[:]) == Ordering::Equal, "leaf_delete edge test: first key was not removed")
+    assert(without_first.get_key(2).compare(key3[:]) == Ordering::Equal, "leaf_delete edge test: last key changed")
+
+    mut deleted_last := BNode::new(BTREE_PAGE_SIZE)
+    leaf_delete(deleted_last, leaf, 3)
+    key2 := make_test_key(2)
+    key0 := make_test_key(0)
+    assert(deleted_last.nkeys() == 3, "leaf_delete edge test: last delete count changed incorrectly")
+    assert(deleted_last.get_key(0).compare(key0[:]) == Ordering::Equal, "leaf_delete edge test: first key changed")
+    assert(deleted_last.get_key(2).compare(key2[:]) == Ordering::Equal, "leaf_delete edge test: last key was not removed")
+}
+
+fun test_leaf_delete() {
+    test_leaf_delete_removes_middle_key()
+    test_leaf_delete_removes_edge_keys()
+}
+
+fun test_node_merge_combines_siblings() {
+    left := make_test_leaf_from(0, 2, 4)
+    right := make_test_leaf_from(2, 2, 5)
+    mut merged := BNode::new(BTREE_PAGE_SIZE)
+    node_merge(merged, left, right)
+
+    key0 := make_test_key(0)
+    key1 := make_test_key(1)
+    key2 := make_test_key(2)
+    key3 := make_test_key(3)
+
+    assert(merged.btype() == BTREE_NODE_TYPE_LEAF, "node_merge test: expected leaf")
+    assert(merged.nkeys() == 4, "node_merge test: key count changed incorrectly")
+    assert(merged.get_key(0).compare(key0[:]) == Ordering::Equal, "node_merge test: first key changed")
+    assert(merged.get_key(1).compare(key1[:]) == Ordering::Equal, "node_merge test: second key changed")
+    assert(merged.get_key(2).compare(key2[:]) == Ordering::Equal, "node_merge test: third key changed")
+    assert(merged.get_key(3).compare(key3[:]) == Ordering::Equal, "node_merge test: fourth key changed")
+    assert(merged.get_val(2)[0] == 2 as u8, "node_merge test: right value was not copied")
+}
+
+fun test_node_replace_2_kid_replaces_adjacent_links() {
+    mut old := BNode::new(BTREE_PAGE_SIZE)
+    old.set_header(BTREE_NODE_TYPE_NODE, 3)
+    append_test_child(old, 0, 10, 0)
+    append_test_child(old, 1, 11, 2)
+    append_test_child(old, 2, 12, 4)
+
+    mut new := BNode::new(BTREE_PAGE_SIZE)
+    key2 := make_test_key(2)
+    node_replace_2_kid(new, old, 1, 77, key2[:])
+
+    key0 := make_test_key(0)
+    assert(new.btype() == BTREE_NODE_TYPE_NODE, "node_replace_2_kid test: expected internal node")
+    assert(new.nkeys() == 2, "node_replace_2_kid test: key count changed incorrectly")
+    assert(new.get_ptr(0) == 10 as u64, "node_replace_2_kid test: left pointer changed")
+    assert(new.get_ptr(1) == 77 as u64, "node_replace_2_kid test: merged pointer was not inserted")
+    assert(new.get_key(0).compare(key0[:]) == Ordering::Equal, "node_replace_2_kid test: left key changed")
+    assert(new.get_key(1).compare(key2[:]) == Ordering::Equal, "node_replace_2_kid test: merged key was not inserted")
+}
+
+fun test_should_merge_selects_left_sibling() {
+    mut tree := new_memory_tree()
+    left := make_test_leaf_from(0, 2, 4)
+    updated := make_test_leaf_from(2, 1, 4)
+    left_ptr := (tree.new)(left.data.as_slice())
+    updated_ptr := (tree.new)(updated.data.as_slice())
+
+    mut parent := BNode::new(BTREE_PAGE_SIZE)
+    parent.set_header(BTREE_NODE_TYPE_NODE, 2)
+    append_test_child(parent, 0, left_ptr, 0)
+    append_test_child(parent, 1, updated_ptr, 2)
+
+    let (dir, sibling) = should_merge(tree, parent, 1, updated)
+    assert(dir < 0, "should_merge left test: expected left merge")
+    assert(sibling.get_key(0).compare(left.get_key(0)) == Ordering::Equal, "should_merge left test: wrong sibling")
+}
+
+fun test_should_merge_selects_right_sibling() {
+    mut tree := new_memory_tree()
+    updated := make_test_leaf_from(0, 1, 4)
+    right := make_test_leaf_from(1, 2, 4)
+    updated_ptr := (tree.new)(updated.data.as_slice())
+    right_ptr := (tree.new)(right.data.as_slice())
+
+    mut parent := BNode::new(BTREE_PAGE_SIZE)
+    parent.set_header(BTREE_NODE_TYPE_NODE, 2)
+    append_test_child(parent, 0, updated_ptr, 0)
+    append_test_child(parent, 1, right_ptr, 1)
+
+    let (dir, sibling) = should_merge(tree, parent, 0, updated)
+    assert(dir > 0, "should_merge right test: expected right merge")
+    assert(sibling.get_key(0).compare(right.get_key(0)) == Ordering::Equal, "should_merge right test: wrong sibling")
+}
+
+fun test_should_merge_keeps_large_or_unmergeable_nodes() {
+    large_updated := make_test_leaf(10, 300)
+    let (large_dir, large_sibling) = should_merge(dummy_tree(), BNode::new(0), 0, large_updated)
+    assert(large_dir == 0, "should_merge no-merge test: large updated node should not merge")
+    assert(large_sibling.data.len() == 0, "should_merge no-merge test: expected empty sibling")
+
+    mut tree := new_memory_tree()
+    small_updated := make_test_leaf_from(0, 1, 4)
+    large_sibling_node := make_test_leaf_from(1, 12, 324)
+    updated_ptr := (tree.new)(small_updated.data.as_slice())
+    sibling_ptr := (tree.new)(large_sibling_node.data.as_slice())
+
+    mut parent := BNode::new(BTREE_PAGE_SIZE)
+    parent.set_header(BTREE_NODE_TYPE_NODE, 2)
+    append_test_child(parent, 0, updated_ptr, 0)
+    append_test_child(parent, 1, sibling_ptr, 1)
+
+    let (merged_dir, merged_sibling) = should_merge(tree, parent, 0, small_updated)
+    assert(merged_dir == 0, "should_merge no-merge test: oversized merged node should not merge")
+    assert(merged_sibling.data.len() == 0, "should_merge no-merge test: expected empty oversized sibling")
+}
+
+fun test_node_merge_helpers() {
+    test_node_merge_combines_siblings()
+    test_node_replace_2_kid_replaces_adjacent_links()
+    test_should_merge_selects_left_sibling()
+    test_should_merge_selects_right_sibling()
+    test_should_merge_keeps_large_or_unmergeable_nodes()
+}
+
+fun test_btree_insert_creates_root_with_sentinel() {
+    mut tree := new_memory_tree()
+    key := make_test_key(1)
+    assert_ok(tree.insert(key[:], b"v1"), "BTree.insert root test: insert failed")
+
+    root := load_node(tree, tree.root)
+    assert(root.btype() == BTREE_NODE_TYPE_LEAF, "BTree.insert root test: expected leaf root")
+    assert(root.nkeys() == 2, "BTree.insert root test: expected sentinel and first key")
+    assert(root.get_key(0).compare(b"") == Ordering::Equal, "BTree.insert root test: missing sentinel")
+    assert(root.get_key(1).compare(key[:]) == Ordering::Equal, "BTree.insert root test: key not inserted")
+    assert(root.get_val(1).compare(b"v1") == Ordering::Equal, "BTree.insert root test: value not inserted")
+}
+
+fun test_btree_insert_updates_existing_key() {
+    mut tree := new_memory_tree()
+    key := make_test_key(1)
+    assert_ok(tree.insert(key[:], b"v1"), "BTree.insert update test: first insert failed")
+    assert_ok(tree.insert(key[:], b"v2"), "BTree.insert update test: update failed")
+
+    root := load_node(tree, tree.root)
+    assert(root.btype() == BTREE_NODE_TYPE_LEAF, "BTree.insert update test: expected leaf root")
+    assert(root.nkeys() == 2, "BTree.insert update test: key count changed")
+    assert(root.get_val(1).compare(b"v2") == Ordering::Equal, "BTree.insert update test: value not updated")
+}
+
+fun test_btree_insert_splits_root() {
+    mut tree := new_memory_tree()
+
+    mut i := 1
+    while i <= 50 {
+        key := make_test_key(i as u8)
+        val := Vector<u8>::filled(160, i as u8)
+        assert_ok(tree.insert(key[:], val.as_slice()), "BTree.insert split test: insert failed")
+        i += 1
+    }
+
+    root := load_node(tree, tree.root)
+    assert(root.btype() == BTREE_NODE_TYPE_NODE, "BTree.insert split test: expected internal root")
+    assert(root.nkeys() >= 2, "BTree.insert split test: expected split root")
+    assert(root.get_key(0).compare(b"") == Ordering::Equal, "BTree.insert split test: root lost sentinel range")
+    assert_page_sized(root, "BTree.insert split test: root exceeds page size")
+
+    mut j := 1
+    while j <= 50 {
+        key := make_test_key(j as u8)
+        val := find_stored_value(tree, key[:])
+        assert(val.len() == 160, "BTree.insert split test: value length changed")
+        assert(val[0] == j as u8, "BTree.insert split test: value changed")
+        j += 1
+    }
+}
+
+fun test_btree_insert_rejects_limits() {
+    mut tree := new_memory_tree()
+
+    assert_btree_error(tree.insert(b"", b""), BTreeError::EmptyKey, "BTree.insert limit test: empty key was accepted")
+
+    big_key := Vector<u8>::filled(BTREE_MAX_KEY_SIZE + 1, 1)
+    assert_btree_error(tree.insert(big_key.as_slice(), b"v"), BTreeError::KeyTooLarge, "BTree.insert limit test: oversized key was accepted")
+
+    key := make_test_key(1)
+    big_val := Vector<u8>::filled(BTREE_MAX_VAL_SIZE + 1, 1)
+    assert_btree_error(tree.insert(key[:], big_val.as_slice()), BTreeError::ValueTooLarge, "BTree.insert limit test: oversized value was accepted")
+}
+
+fun test_btree_insert() {
+    test_btree_insert_creates_root_with_sentinel()
+    test_btree_insert_updates_existing_key()
+    test_btree_insert_splits_root()
+    test_btree_insert_rejects_limits()
+}
+
+export fun run_database_tests() {
+    test_node_split3()
+    test_tree_insert()
+    test_leaf_delete()
+    test_node_merge_helpers()
+    test_btree_insert()
+}

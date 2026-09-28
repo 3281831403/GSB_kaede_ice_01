@@ -1,0 +1,26 @@
+[package]
+name = "kaede_semantic"
+version = "0.2.0"
+edition = "2021"
+
+license = "MIT OR Apache-2.0"
+[dependencies]
+anyhow = "1.0.68"
+thiserror = "2.0.18"
+serde_json = "1.0"
+toml = "1.1"
+rustdoc-json = "0.9"
+rustdoc-types = "0.61"
+
+kaede_ast = { path = "../ast" }
+kaede_ast_type = { path = "../ast_type" }
+kaede_ir = { path = "../ir" }
+kaede_symbol = { path = "../symbol" }
+kaede_span = { path = "../span" }
+kaede_parse = { path = "../parse" }
+kaede_common = { path = "../common" }
+kaede_symbol_table = { path = "../symbol_table" }
+kaede_type_infer = { path = "../type_infer" }
+
+[dev-dependencies]
+tempfile = "3.8.1"

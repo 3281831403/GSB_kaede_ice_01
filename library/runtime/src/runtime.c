@@ -1,0 +1,99 @@
+#include <errno.h>
+#include <gc/gc.h>
+#include <kaede/runtime.h>
+#include <kaede/signal.h>
+#include <kaede/task.h>
+#include <kaede/worker.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int runtime_threads = 0;
+static int runtime_started_threads = 0;
+static pthread_t *runtime_worker_threads = NULL;
+
+void kaede_runtime_init(void) {
+    worker_reset_main_state();
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        fprintf(stderr, "Failed to ignore SIGPIPE: %s\n", strerror(errno));
+        abort();
+    }
+    kaede_install_crash_handler();
+    if (!worker_init()) {
+        fprintf(stderr, "Failed to initialize worker/runtime\n");
+        abort();
+    }
+    GC_allow_register_threads();
+}
+
+void kaede_spawn_main(TaskFn fn, void *arg, size_t arg_size) {
+    if (!worker_spawn(fn, arg, arg_size, true)) {
+        fprintf(stderr, "Failed to spawn main task\n");
+        abort();
+    }
+}
+
+int kaede_runtime_run(void) {
+    runtime_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    runtime_started_threads = 0;
+
+    if (runtime_threads <= 0) {
+        fprintf(stderr, "Failed to get number of threads: %s\n",
+                strerror(errno));
+        return 1;
+    }
+
+    runtime_worker_threads = calloc(runtime_threads, sizeof(pthread_t));
+    if (!runtime_worker_threads) {
+        fprintf(stderr, "Failed to allocate worker threads\n");
+        return 1;
+    }
+
+    for (int worker_id = 0; worker_id < runtime_threads; ++worker_id) {
+        if (pthread_create(&runtime_worker_threads[worker_id], NULL,
+                           worker_loop, (void *)(intptr_t)worker_id) != 0) {
+            fprintf(stderr, "Failed to create worker thread\n");
+            worker_request_shutdown();
+            for (int i = 0; i < runtime_started_threads; ++i) {
+                (void)pthread_join(runtime_worker_threads[i], NULL);
+            }
+            free(runtime_worker_threads);
+            runtime_worker_threads = NULL;
+            runtime_started_threads = 0;
+            return 1;
+        }
+        runtime_started_threads++;
+    }
+
+    return worker_wait_for_main();
+}
+
+void kaede_runtime_shutdown(void) {
+    worker_request_shutdown();
+
+    if (runtime_worker_threads) {
+        for (int i = 0; i < runtime_started_threads; ++i) {
+            (void)pthread_join(runtime_worker_threads[i], NULL);
+        }
+        free(runtime_worker_threads);
+        runtime_worker_threads = NULL;
+    }
+
+    runtime_started_threads = 0;
+    runtime_threads = 0;
+    worker_deinit();
+}
+
+KaedeIoWaitResult kaede_io_wait_readable(int fd) {
+    return worker_park_current_on_io(fd, KAEDE_IO_EVENT_READ);
+}
+
+KaedeIoWaitResult kaede_io_wait_writable(int fd) {
+    return worker_park_current_on_io(fd, KAEDE_IO_EVENT_WRITE);
+}
+
+void kaede_io_forget_fd(int fd) { worker_forget_fd(fd); }

@@ -1,0 +1,27 @@
+export enum Option<T> {
+    Some(T),
+    None,
+}
+
+impl<T> Option<T> {
+    export fun is_some(self) -> bool {
+        return match self {
+            Option::Some(_) => true,
+            Option::None => false,
+        }
+    }
+
+    export fun is_none(self) -> bool {
+        return match self {
+            Option::Some(_) => false,
+            Option::None => true,
+        }
+    }
+
+    export fun unwrap(self) -> T {
+        return match self {
+            Option::Some(value) => value,
+            Option::None => panic("called `Option::unwrap()` on a `None` value"),
+        }
+    }
+}

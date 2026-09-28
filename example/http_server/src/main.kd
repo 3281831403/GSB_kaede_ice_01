@@ -1,0 +1,63 @@
+import std.net.http
+
+mut app := std.net.http.App::new()
+
+app.ws("/ws/echo", |req, ws| {
+    loop {
+        msg := ws.receive()
+        match msg {
+            Option::Some(msg) => {
+                match msg.kind {
+                    std.net.http.WebSocketMessageKind::Text => {
+                        if !ws.send(msg) {
+                            return
+                        }
+                    }
+                    std.net.http.WebSocketMessageKind::Binary => {
+                        if !ws.send(msg) {
+                            return
+                        }
+                    }
+                    std.net.http.WebSocketMessageKind::Close => {
+                        return
+                    }
+                    std.net.http.WebSocketMessageKind::Ping => {},
+                    std.net.http.WebSocketMessageKind::Pong => {},
+                }
+            }
+            Option::None => {
+                return
+            }
+        }
+    }
+})
+
+app.get("/", |req, res| {
+    res.send("Kaede!")
+})
+
+app.post("/echo", |req, res| {
+    res.send(req.body)
+})
+
+app.get("/status/notfound", |req, res| {
+    res.status(std.net.http.Status::NotFound).send("Not Found")
+})
+
+app.get("/query", |req, res| {
+    name := req.query("name")
+    res.send(match name {
+        Option::Some(name) => name.as_str(),
+        Option::None => "No name provided"
+    })
+})
+
+app.get("/users/:id", |req, res| {
+    id := req.param("id")
+    res.send(match id {
+        Option::Some(id) => id.as_str(),
+        Option::None => "No id provided"
+    })
+})
+
+app.listen(port=8080)

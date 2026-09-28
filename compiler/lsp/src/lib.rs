@@ -1,0 +1,439 @@
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
+use kaede_parse::{ParseError, Parser};
+use kaede_semantic::{AnalyzeOptions, SemanticAnalyzer, SemanticError};
+use kaede_span::{file::FilePath, Location, Span};
+use kaede_type_infer::TypeInferError;
+use tokio::{sync::Notify, sync::RwLock, task::JoinHandle};
+use tower_lsp::{
+    async_trait,
+    lsp_types::{
+        Diagnostic, DiagnosticSeverity, InitializeParams, InitializeResult, MessageType, Position,
+        Range, ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
+        Url,
+    },
+    Client, LanguageServer, LspService, Server,
+};
+
+const DEBOUNCE: Duration = Duration::from_millis(100);
+
+fn ast_has_entry_candidate(ast: &kaede_ast::CompileUnit) -> bool {
+    ast.items.iter().any(|item| match item {
+        kaede_ast::ModuleItem::Stmt(_) => true,
+        kaede_ast::ModuleItem::Decl(top_level) => matches!(
+            &top_level.kind,
+            kaede_ast::top::TopLevelKind::Fn(fn_) if fn_.decl.name.symbol().as_str() == "main"
+        ),
+    })
+}
+
+#[derive(Debug)]
+struct DocState {
+    text: String,
+    version: u64,
+    notify: Arc<Notify>,
+}
+
+#[derive(Debug)]
+pub struct Backend {
+    client: Client,
+    documents: Arc<RwLock<HashMap<Url, DocState>>>,
+    workers: RwLock<HashMap<Url, JoinHandle<()>>>,
+    root_dir: RwLock<Option<PathBuf>>,
+}
+
+impl Backend {
+    pub fn new(client: Client) -> Self {
+        Self {
+            client,
+            documents: Arc::new(RwLock::new(HashMap::new())),
+            workers: RwLock::new(HashMap::new()),
+            root_dir: RwLock::new(None),
+        }
+    }
+
+    async fn current_root_dir(&self, file_path: &Path) -> PathBuf {
+        self.root_dir
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| fallback_root_dir(file_path))
+    }
+}
+
+fn analyze_text(file_path: PathBuf, text: String, root_dir: PathBuf) -> Vec<Diagnostic> {
+    let file = FilePath::from(file_path);
+    let ast = match Parser::new(&text, file).run() {
+        Ok(ast) => ast,
+        Err(err) => return diagnostics_from_parse_error(err),
+    };
+
+    // The LSP does not parse Kaede.toml; default to the legacy "rust/" lookup
+    // so rust-interop projects still get diagnostics for `import rust::<crate>`.
+    let mut analyzer = match SemanticAnalyzer::new(file, root_dir, Some(PathBuf::from("rust"))) {
+        Ok(analyzer) => analyzer,
+        Err(err) => return diagnostics_from_semantic_error(err),
+    };
+    let is_entry_unit = ast_has_entry_candidate(&ast);
+    match analyzer.analyze(
+        ast,
+        AnalyzeOptions {
+            no_autoload: false,
+            no_prelude: false,
+            is_entry_unit,
+        },
+    ) {
+        Ok(_) => Vec::new(),
+        Err(err) => diagnostics_from_semantic_error(err),
+    }
+}
+
+async fn run_worker(
+    uri: Url,
+    file_path: PathBuf,
+    root_dir: PathBuf,
+    documents: Arc<RwLock<HashMap<Url, DocState>>>,
+    notify: Arc<Notify>,
+    client: Client,
+) {
+    loop {
+        notify.notified().await;
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(DEBOUNCE) => break,
+                _ = notify.notified() => continue,
+            }
+        }
+
+        let (text, version) = match documents.read().await.get(&uri) {
+            Some(doc) => (doc.text.clone(), doc.version),
+            None => return,
+        };
+
+        let analyze_file_path = file_path.clone();
+        let analyze_root_dir = root_dir.clone();
+        let diagnostics = tokio::task::spawn_blocking(move || {
+            analyze_text(analyze_file_path, text, analyze_root_dir)
+        })
+        .await
+        .unwrap_or_else(|err| vec![diagnostic_with_span(None, err.to_string())]);
+
+        // Drop the result if a newer edit landed while we were analyzing — the
+        // notify pulse from that edit will already have us looping again.
+        let still_current = documents
+            .read()
+            .await
+            .get(&uri)
+            .map(|doc| doc.version == version)
+            .unwrap_or(false);
+        if still_current {
+            client
+                .publish_diagnostics(uri.clone(), diagnostics, None)
+                .await;
+        }
+    }
+}
+
+pub async fn run_stdio() {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let (service, socket) = LspService::new(Backend::new);
+    Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[async_trait]
+impl LanguageServer for Backend {
+    async fn initialize(
+        &self,
+        params: InitializeParams,
+    ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
+        if let Some(root_uri) = params.root_uri {
+            if let Ok(path) = root_uri.to_file_path() {
+                *self.root_dir.write().await = Some(path);
+            }
+        }
+
+        Ok(InitializeResult {
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
+                ..ServerCapabilities::default()
+            },
+            server_info: Some(ServerInfo {
+                name: "kaede-lsp".to_string(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            }),
+        })
+    }
+
+    async fn initialized(&self, _: tower_lsp::lsp_types::InitializedParams) {
+        self.client
+            .log_message(MessageType::INFO, "Kaede LSP initialized")
+            .await;
+    }
+
+    async fn did_open(&self, params: tower_lsp::lsp_types::DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let text = params.text_document.text;
+
+        let file_path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
+                self.client
+                    .log_message(MessageType::ERROR, "Invalid file URI")
+                    .await;
+                self.client.publish_diagnostics(uri, Vec::new(), None).await;
+                return;
+            }
+        };
+        let root_dir = self.current_root_dir(&file_path).await;
+
+        let notify = Arc::new(Notify::new());
+        self.documents.write().await.insert(
+            uri.clone(),
+            DocState {
+                text,
+                version: 0,
+                notify: notify.clone(),
+            },
+        );
+
+        let handle = tokio::spawn(run_worker(
+            uri.clone(),
+            file_path,
+            root_dir,
+            self.documents.clone(),
+            notify.clone(),
+            self.client.clone(),
+        ));
+        if let Some(old) = self.workers.write().await.insert(uri, handle) {
+            old.abort();
+        }
+        notify.notify_one();
+    }
+
+    async fn did_change(&self, params: tower_lsp::lsp_types::DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let text = params
+            .content_changes
+            .into_iter()
+            .last()
+            .map(|change| change.text)
+            .unwrap_or_default();
+
+        let notify = {
+            let mut docs = self.documents.write().await;
+            match docs.get_mut(&uri) {
+                Some(doc) => {
+                    doc.text = text;
+                    doc.version = doc.version.wrapping_add(1);
+                    doc.notify.clone()
+                }
+                None => return,
+            }
+        };
+        notify.notify_one();
+    }
+
+    async fn did_close(&self, params: tower_lsp::lsp_types::DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        self.documents.write().await.remove(&uri);
+        if let Some(handle) = self.workers.write().await.remove(&uri) {
+            handle.abort();
+        }
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+    }
+
+    async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+        Ok(())
+    }
+}
+
+fn fallback_root_dir(file_path: &Path) -> PathBuf {
+    file_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+fn location_to_position(location: Location) -> Position {
+    let line = location.line.saturating_sub(1).max(0) as u32;
+    let character = location.column.saturating_sub(1).max(0) as u32;
+    Position::new(line, character)
+}
+
+fn span_to_range(span: Span) -> Range {
+    Range::new(
+        location_to_position(span.start),
+        location_to_position(span.finish),
+    )
+}
+
+pub fn file_path_to_url(file_path: FilePath) -> Option<Url> {
+    Url::from_file_path(file_path.path()).ok()
+}
+
+fn diagnostic_with_span(span: Option<Span>, message: String) -> Diagnostic {
+    let range = span
+        .map(span_to_range)
+        .unwrap_or_else(|| Range::new(Position::new(0, 0), Position::new(0, 0)));
+
+    Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        message,
+        ..Diagnostic::default()
+    }
+}
+
+fn diagnostics_from_parse_error(err: anyhow::Error) -> Vec<Diagnostic> {
+    match err.downcast::<ParseError>() {
+        Ok(parse_err) => vec![diagnostic_with_span(
+            parse_error_span(&parse_err),
+            parse_err.to_string(),
+        )],
+        Err(err) => vec![diagnostic_with_span(None, err.to_string())],
+    }
+}
+
+fn diagnostics_from_semantic_error(err: anyhow::Error) -> Vec<Diagnostic> {
+    match err.downcast::<SemanticError>() {
+        Ok(semantic_err) => vec![diagnostic_with_span(
+            semantic_error_span(&semantic_err),
+            semantic_err.to_string(),
+        )],
+        Err(err) => match err.downcast::<TypeInferError>() {
+            Ok(type_err) => vec![diagnostic_with_span(
+                type_infer_error_span(&type_err),
+                type_err.to_string(),
+            )],
+            // `{:#}` so the `with_context` chain on plain anyhow errors (for
+            // example a source path that cannot be resolved) survives into the
+            // diagnostic instead of being cut down to its outermost message.
+            Err(err) => vec![diagnostic_with_span(None, format!("{err:#}"))],
+        },
+    }
+}
+
+fn parse_error_span(err: &ParseError) -> Option<Span> {
+    match err {
+        ParseError::ExpectedError { span, .. }
+        | ParseError::OutOfRangeForI32(span)
+        | ParseError::OutOfRangeForU32(span)
+        | ParseError::InvalidFloatLiteral(span)
+        | ParseError::UnsupportedForeignUse { span } => Some(*span),
+    }
+}
+
+fn semantic_error_span(err: &SemanticError) -> Option<Span> {
+    match err {
+        SemanticError::Undeclared { span, .. }
+        | SemanticError::PrivateItemAccess { span, .. }
+        | SemanticError::NotCallable { span, .. }
+        | SemanticError::InvalidTypeForArithmeticOperation { span, .. }
+        | SemanticError::GenericArgumentLengthMismatch { span, .. }
+        | SemanticError::CannotCallMutableMethodOnImmutableValue { span }
+        | SemanticError::ExpectedVariable { span, .. }
+        | SemanticError::CatchAllArmMustBeLast { span }
+        | SemanticError::MatchCannotBeUsedWithValueOfType { span, .. }
+        | SemanticError::TooFewArguments { span, .. }
+        | SemanticError::TooManyArguments { span, .. }
+        | SemanticError::UnknownParameterName { span, .. }
+        | SemanticError::DuplicateArgument { span, .. }
+        | SemanticError::PositionalArgumentAfterKeyword { span }
+        | SemanticError::AlreadyDeclared { span, .. }
+        | SemanticError::VoidVariable { span, .. }
+        | SemanticError::BreakOutsideOfLoop { span }
+        | SemanticError::MismatchedTypes { span, .. }
+        | SemanticError::InvalidLeftOfAssignment { span }
+        | SemanticError::CannotAssignTwiceToImutable { span }
+        | SemanticError::HasNoFields { span }
+        | SemanticError::NoField { span, .. }
+        | SemanticError::FileNotFoundForModule { span, .. }
+        | SemanticError::TupleRequireAccessByIndex { span }
+        | SemanticError::IndexOutOfRange { span, .. }
+        | SemanticError::ArrayRepeatCountNotConst { span }
+        | SemanticError::ArrayRepeatCountTooLarge { span, .. }
+        | SemanticError::ConstInitializerNotConst { span }
+        | SemanticError::NumberOfTupleFieldsDoesNotMatch { span, .. }
+        | SemanticError::IfMustHaveElseUsedAsExpr { span }
+        | SemanticError::IfAndElseHaveIncompatibleTypes { span, .. }
+        | SemanticError::CannotAssignImmutableToMutable { span }
+        | SemanticError::NoMember { span, .. }
+        | SemanticError::NoMethod { span, .. }
+        | SemanticError::NoVariant { span, .. }
+        | SemanticError::NotAnEnum { span, .. }
+        | SemanticError::CannotAssignValueToVariant { span, .. }
+        | SemanticError::NotIndexable { span, .. }
+        | SemanticError::UnreachablePattern { span }
+        | SemanticError::NeverIfExpr { span }
+        | SemanticError::MatchNotExhaustive { span, .. }
+        | SemanticError::MatchMustHaveNonCatchAllArm { span }
+        | SemanticError::DuplicatePattern { span, .. }
+        | SemanticError::UnitVariantCannotUnpack { span, .. }
+        | SemanticError::ExpectedTypeInCast { span }
+        | SemanticError::SpawnTargetNotCall { span }
+        | SemanticError::SpawnReturnTypeNotUnit { span, .. }
+        | SemanticError::ChannelSendRequiresChannel { span, .. }
+        | SemanticError::ChannelRecvRequiresChannel { span, .. }
+        | SemanticError::SelectCaseRequiresChannel { span, .. }
+        | SemanticError::UnsupportedLanguageLinkage { span, .. }
+        | SemanticError::TopLevelStatementsWithExplicitMain { span }
+        | SemanticError::TopLevelStatementsOnlyAllowedInEntryUnit { span }
+        | SemanticError::MainOnlyAllowedInEntryUnit { span }
+        | SemanticError::FormatTemplateMustBeStringLiteral { span }
+        | SemanticError::InvalidFormatTemplate { span, .. }
+        | SemanticError::FormatPlaceholderCountMismatch { span, .. }
+        | SemanticError::TryRequiresResult { span, .. }
+        | SemanticError::TryOutsideResultFunction { span, .. }
+        | SemanticError::TryRequiresOption { span, .. }
+        | SemanticError::TryOutsideOptionFunction { span, .. }
+        | SemanticError::GenericBoundMustBeInterface { span, .. }
+        | SemanticError::GenericBoundNotSatisfied { span, .. }
+        | SemanticError::InterfaceNotImplemented { span, .. }
+        | SemanticError::InterfaceMethodNotObjectSafe { span, .. }
+        | SemanticError::CannotBoxNonUdtAsInterface { span, .. } => Some(*span),
+        SemanticError::MainNotFound
+        | SemanticError::LLVMError { .. }
+        | SemanticError::FailedToLookupTarget { .. }
+        | SemanticError::FailedToCreateTargetMachine => None,
+    }
+}
+
+fn type_infer_error_span(err: &TypeInferError) -> Option<Span> {
+    match err {
+        TypeInferError::ArraySizeMismatch { span, .. }
+        | TypeInferError::ExpectedArrayType { span, .. }
+        | TypeInferError::TupleArityMismatch { span, .. }
+        | TypeInferError::ExpectedTupleType { span, .. }
+        | TypeInferError::UndefinedVariable { span, .. }
+        | TypeInferError::FieldNotFound { span, .. }
+        | TypeInferError::FieldAccessOnNonStruct { span, .. }
+        | TypeInferError::NotATuple { span, .. }
+        | TypeInferError::TupleIndexOutOfBounds { span, .. }
+        | TypeInferError::StrIndexOutOfBounds { span }
+        | TypeInferError::NotIndexable { span }
+        | TypeInferError::ArgumentCountMismatch { span, .. }
+        | TypeInferError::TupleUnpackCountMismatch { span, .. }
+        | TypeInferError::ExpectedTupleForUnpack { span }
+        | TypeInferError::CannotInferType { span }
+        | TypeInferError::CannotInferVariableType { span }
+        | TypeInferError::CannotInferGenericArguments { span, .. }
+        | TypeInferError::InvalidIntegerLiteralType { span, .. }
+        | TypeInferError::InvalidFloatLiteralType { span, .. }
+        | TypeInferError::ExpectedIntegerTypeForBitOp { span, .. }
+        | TypeInferError::ExpectedIntegerTypeForBitNot { span, .. }
+        | TypeInferError::EnumEqRequiresUnitVariants { span, .. }
+        | TypeInferError::CannotUnify { span, .. } => Some(*span),
+        TypeInferError::OccursCheckFailed { .. }
+        | TypeInferError::TupleArityMismatchInUnify { .. } => None,
+    }
+}

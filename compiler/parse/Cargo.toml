@@ -1,0 +1,19 @@
+[package]
+name = "kaede_parse"
+version = "0.2.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+license = "MIT OR Apache-2.0"
+[dependencies]
+anyhow = "1.0.68"
+thiserror = "2.0.18"
+
+kaede_lex = { path = "../lex" }
+kaede_ast = { path = "../ast" }
+kaede_span = { path = "../span" }
+kaede_ast_type = { path = "../ast_type" }
+kaede_symbol = { path = "../symbol" }
+kaede_type_infer = { path = "../type_infer" }
+kaede_common = { path = "../common" }

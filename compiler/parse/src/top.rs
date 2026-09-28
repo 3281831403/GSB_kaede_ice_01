@@ -1,0 +1,785 @@
+use std::{collections::VecDeque, rc::Rc};
+
+use kaede_ast::{
+    top::{
+        Enum, EnumVariant, Extern, Fn, FnDecl, GenericParam, GenericParams, Impl, Import,
+        ImportKind, Interface, InterfaceMethod, Param, Params, Path, PathSegment, Struct,
+        StructField, TopLevel, TopLevelKind, TypeAlias, Use, VariadicKind, Visibility,
+    },
+    ModuleItem,
+};
+use kaede_ast_type::{Mutability, Ty};
+use kaede_common::LangLinkage;
+use kaede_lex::token::{Token, TokenKind};
+use kaede_span::Location;
+
+use crate::{
+    error::{ParseError, ParseResult},
+    Parser,
+};
+
+impl Parser {
+    pub fn module_item(&mut self) -> ParseResult<ModuleItem> {
+        if self.is_top_level_decl_start() {
+            return Ok(ModuleItem::Decl(self.top_level()?));
+        }
+
+        let stmt = self.stmt()?;
+        self.consume_semi()?;
+        Ok(ModuleItem::Stmt(stmt))
+    }
+
+    pub fn top_level(&mut self) -> ParseResult<TopLevel> {
+        let vis = self.consume_b(&TokenKind::Export).into();
+
+        let token = self.first();
+        let mut consumes_own_terminator = false;
+
+        let (span, kind) = match token.kind {
+            TokenKind::Import => {
+                let kind = self.import()?;
+                (kind.span, TopLevelKind::Import(kind))
+            }
+
+            TokenKind::Fun => {
+                let kind = self.func(vis)?;
+                (kind.span, TopLevelKind::Fn(kind))
+            }
+
+            TokenKind::Struct => {
+                let kind = self.struct_(vis)?;
+                (kind.span, TopLevelKind::Struct(kind))
+            }
+
+            TokenKind::Impl => {
+                let kind = self.impl_()?;
+                (kind.span, TopLevelKind::Impl(kind))
+            }
+
+            TokenKind::Enum => {
+                let kind = self.enum_(vis)?;
+                (kind.span, TopLevelKind::Enum(kind))
+            }
+
+            TokenKind::Extern => {
+                let kind = self.extern_(vis)?;
+                (kind.span, TopLevelKind::Extern(kind))
+            }
+
+            TokenKind::Use => {
+                let kind = self.use_(vis)?;
+                (kind.span, TopLevelKind::Use(kind))
+            }
+
+            TokenKind::Type => {
+                consumes_own_terminator = true;
+                let kind = self.type_alias(vis)?;
+                (kind.span, TopLevelKind::TypeAlias(kind))
+            }
+
+            TokenKind::Interface => {
+                let kind = self.interface(vis)?;
+                (kind.span, TopLevelKind::Interface(kind))
+            }
+
+            TokenKind::Const => {
+                let kind = self.top_level_const(vis)?;
+                (kind.span, TopLevelKind::Const(kind))
+            }
+
+            _ => {
+                return Err(ParseError::ExpectedError {
+                    expected: "top-level declaration".to_string(),
+                    but: token.kind.to_string(),
+                    span: token.span,
+                }
+                .into())
+            }
+        };
+
+        if !consumes_own_terminator {
+            self.consume_semi()?;
+        }
+
+        Ok(TopLevel { kind, span })
+    }
+
+    fn is_top_level_decl_start(&mut self) -> bool {
+        let token = match self.tokens.front() {
+            Some(token) => &token.kind,
+            None => return false,
+        };
+
+        if matches!(token, TokenKind::Export) {
+            return true;
+        }
+
+        matches!(
+            token,
+            TokenKind::Import
+                | TokenKind::Fun
+                | TokenKind::Struct
+                | TokenKind::Impl
+                | TokenKind::Enum
+                | TokenKind::Extern
+                | TokenKind::Use
+                | TokenKind::Type
+                | TokenKind::Interface
+                | TokenKind::Const
+        )
+    }
+
+    fn top_level_const(&mut self, vis: Visibility) -> ParseResult<kaede_ast::top::TopConst> {
+        let start = self.consume(&TokenKind::Const).unwrap().start;
+        let name = self.ident()?;
+
+        let ty = if self.consume_b(&TokenKind::Colon) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
+
+        self.consume(&TokenKind::Eq)?;
+        let init = self.expr()?;
+        let span = self.new_span(start, init.span.finish);
+
+        Ok(kaede_ast::top::TopConst {
+            vis,
+            name,
+            init: init.into(),
+            ty: ty.unwrap_or_else(|| Ty::new_var(span)).into(),
+            span,
+        })
+    }
+
+    fn type_alias(&mut self, vis: Visibility) -> ParseResult<TypeAlias> {
+        let start = self.consume(&TokenKind::Type)?.start;
+        let name = self.ident()?;
+        self.consume(&TokenKind::Eq)?;
+        let aliased_type = self.ty()?;
+        let finish = aliased_type.span.finish;
+        self.consume_type_alias_terminator(finish)?;
+
+        Ok(TypeAlias {
+            vis,
+            name,
+            aliased_type,
+            span: self.new_span(start, finish),
+        })
+    }
+
+    fn consume_type_alias_terminator(&mut self, type_finish: Location) -> ParseResult<()> {
+        if self.consume_b(&TokenKind::Semi) {
+            return Ok(());
+        }
+
+        let next = self.first();
+        // `Vector<u8>` ends with `>`, which is also a comparison operator, so
+        // the lexer cannot safely insert a semicolon after it without context.
+        if next.kind == TokenKind::Eoi || next.span.start.line > type_finish.line {
+            return Ok(());
+        }
+
+        Err(ParseError::ExpectedError {
+            expected: TokenKind::Semi.to_string(),
+            but: next.kind.to_string(),
+            span: next.span,
+        }
+        .into())
+    }
+
+    fn extern_(&mut self, vis: Visibility) -> ParseResult<Extern> {
+        let start = self.consume(&TokenKind::Extern).unwrap().start;
+
+        let lang_linkage = self.string_literal_internal();
+
+        let fn_decl = self.fn_decl(vis)?;
+
+        Ok(Extern {
+            span: self.new_span(start, fn_decl.span.finish),
+            lang_linkage,
+            fn_decl,
+            vis,
+        })
+    }
+
+    fn generic_params(&mut self) -> ParseResult<Option<GenericParams>> {
+        self.checkpoint();
+
+        let start = self.consume(&TokenKind::Lt)?.start;
+
+        let mut params = Vec::new();
+
+        loop {
+            let name = self.ident()?;
+            let bound = if self.consume_b(&TokenKind::Colon) {
+                Some(self.ident()?)
+            } else {
+                None
+            };
+            params.push(GenericParam { name, bound });
+
+            if !self.consume_list_separator(&TokenKind::Gt)? {
+                break;
+            }
+        }
+
+        Ok(if let Ok(span) = self.consume(&TokenKind::Gt) {
+            Some(GenericParams {
+                params,
+                span: self.new_span(start, span.finish),
+            })
+        } else {
+            self.backtrack();
+            None
+        })
+    }
+
+    fn impl_(&mut self) -> ParseResult<Impl> {
+        let start = self.consume(&TokenKind::Impl).unwrap().start;
+
+        // Push generic param names to determine if types is generic types.
+        let generic_params = if self.check(&TokenKind::Lt) {
+            self.generic_params()?
+        } else {
+            None
+        };
+
+        if let Some(params) = &generic_params {
+            self.generic_param_names_stack
+                .push(params.params.iter().map(|p| p.name.symbol()).collect());
+        }
+
+        let ty = self.ty()?;
+
+        self.consume(&TokenKind::OpenBrace)?;
+
+        let mut items = Vec::new();
+
+        loop {
+            if let Ok(span) = self.consume(&TokenKind::CloseBrace) {
+                // Pop generic param names.
+                if generic_params.is_some() {
+                    self.generic_param_names_stack.pop();
+                }
+
+                return Ok(Impl {
+                    generic_params,
+                    ty,
+                    items: Rc::new(items),
+                    span: self.new_span(start, span.finish),
+                });
+            }
+
+            items.push(self.top_level()?);
+        }
+    }
+
+    fn path(&mut self) -> ParseResult<Path> {
+        let start = self.first().span.start;
+
+        let mut segments = Vec::new();
+
+        loop {
+            // Wildcard
+            if let Ok(span) = self.consume(&TokenKind::Asterisk) {
+                segments.push(PathSegment::Star);
+                // Insert a semi-colon because the star token isn't semi-colon insertable.
+                self.tokens.push_front(Token {
+                    kind: TokenKind::Semi,
+                    span,
+                });
+                break;
+            }
+
+            let segment = self.ident()?;
+
+            segments.push(PathSegment::Segment(segment));
+
+            if !self.consume_b(&TokenKind::Dot) {
+                break;
+            }
+        }
+
+        let finish = self.first().span.finish;
+
+        Ok(Path {
+            segments,
+            span: self.new_span(start, finish),
+        })
+    }
+
+    fn use_(&mut self, vis: Visibility) -> ParseResult<Use> {
+        let start = self.consume(&TokenKind::Use).unwrap().start;
+
+        if let TokenKind::Ident(name) = &self.first().kind {
+            if name == "rust"
+                && matches!(
+                    self.tokens.get(1).map(|t| &t.kind),
+                    Some(TokenKind::DoubleColon)
+                )
+            {
+                return Err(ParseError::UnsupportedForeignUse {
+                    span: self.first().span,
+                }
+                .into());
+            }
+        }
+
+        let path = self.path()?;
+
+        let span = self.new_span(start, path.span.finish);
+
+        Ok(Use { path, span, vis })
+    }
+
+    fn import(&mut self) -> ParseResult<Import> {
+        let start = self.consume(&TokenKind::Import).unwrap().start;
+
+        let first = self.ident()?;
+
+        let (kind, finish, last) =
+            if first.as_str() == "rust" && self.consume_b(&TokenKind::DoubleColon) {
+                let crate_name = self.ident()?;
+                let crate_name_finish = crate_name.span().finish;
+                let crate_symbol = crate_name.symbol();
+
+                if self.check(&TokenKind::DoubleColon) || self.check(&TokenKind::Dot) {
+                    return Err(ParseError::ExpectedError {
+                        expected: "crate name".to_string(),
+                        but: self.first().kind.to_string(),
+                        span: self.first().span,
+                    }
+                    .into());
+                }
+
+                (
+                    ImportKind::Foreign {
+                        lang: first,
+                        crate_name,
+                    },
+                    crate_name_finish,
+                    crate_symbol,
+                )
+            } else {
+                let mut segments = vec![PathSegment::Segment(first)];
+
+                while self.consume_b(&TokenKind::Dot) {
+                    if let Ok(span) = self.consume(&TokenKind::Asterisk) {
+                        segments.push(PathSegment::Star);
+                        self.tokens.push_front(Token {
+                            kind: TokenKind::Semi,
+                            span,
+                        });
+                        break;
+                    }
+
+                    segments.push(PathSegment::Segment(self.ident()?));
+                }
+
+                let path_finish = self.first().span.finish;
+                let path = Path {
+                    segments,
+                    span: self.new_span(start, path_finish),
+                };
+
+                let last = match path.segments.last().unwrap() {
+                    PathSegment::Segment(ident) => ident.symbol(),
+                    PathSegment::Star => todo!(),
+                };
+
+                (ImportKind::Kaede(path), self.first().span.finish, last)
+            };
+
+        if !self.imported_modules.contains(&last) {
+            self.imported_modules.push(last);
+        }
+
+        let span = self.new_span(start, finish);
+
+        Ok(Import { kind, span })
+    }
+
+    fn fn_decl(&mut self, vis: Visibility) -> ParseResult<FnDecl> {
+        let start = self.consume(&TokenKind::Fun)?.start;
+
+        let name = self.ident()?;
+
+        let generic_params = if self.check(&TokenKind::Lt) {
+            self.generic_params()?
+        } else {
+            None
+        };
+
+        // Push generic param names to determine if types is generic types.
+        if let Some(params) = &generic_params {
+            self.generic_param_names_stack
+                .push(params.params.iter().map(|p| p.name.symbol()).collect());
+        }
+
+        let params_start = self.consume(&TokenKind::OpenParen)?.start;
+
+        let mutability = self.consume_b(&TokenKind::Mut).into();
+        let has_self = self.consume_b(&TokenKind::Self_);
+        if !has_self && mutability == Mutability::Mut {
+            todo!("`mut is not allowed not in type");
+        }
+        let first_param = if has_self {
+            let _ = self.consume_list_separator(&TokenKind::CloseParen)?;
+            None
+        } else if self.check(&TokenKind::CloseParen) {
+            None
+        } else {
+            let param = self.fn_param()?;
+            let _ = self.consume_list_separator(&TokenKind::CloseParen)?;
+            Some(param)
+        };
+
+        let params = {
+            let mut params = self.fn_params(params_start)?;
+            if let Some(first_param) = first_param {
+                params.v.push_front(first_param);
+            }
+            params
+        };
+
+        let (return_ty, finish) = if self.consume_b(&TokenKind::Arrow) {
+            let ret_ty = Rc::new(self.ty()?);
+            let finish = ret_ty.span.finish;
+            (ret_ty, finish)
+        } else {
+            let unit_span = self.new_span(params.span.finish, params.span.finish);
+            (Rc::new(Ty::new_unit(unit_span)), params.span.finish)
+        };
+
+        // Pop generic param names.
+        if generic_params.is_some() {
+            self.generic_param_names_stack.pop();
+        }
+
+        Ok(FnDecl {
+            lang_linkage: LangLinkage::Default,
+            vis,
+            link_once: false,
+            self_: if has_self { Some(mutability) } else { None },
+            name,
+            generic_params,
+            params,
+            return_ty,
+            span: self.new_span(start, finish),
+        })
+    }
+
+    fn func(&mut self, vis: Visibility) -> ParseResult<Fn> {
+        let decl = self.fn_decl(vis)?;
+
+        let body = Rc::new(self.block()?);
+
+        let span = self.new_span(decl.span.start, body.span.finish);
+
+        Ok(Fn { decl, body, span })
+    }
+
+    fn fn_params(&mut self, span_start: Location) -> ParseResult<Params> {
+        let mut params = VecDeque::new();
+
+        if let Ok(span) = self.consume(&TokenKind::CloseParen) {
+            return Ok(Params {
+                v: params,
+                span: self.new_span(span_start, span.finish),
+                variadic: VariadicKind::None,
+            });
+        }
+
+        loop {
+            if let Some(variadic) = self.vararg() {
+                let _ = self.consume_list_separator(&TokenKind::CloseParen)?;
+                let finish = self.consume(&TokenKind::CloseParen)?.finish;
+                break Ok(Params {
+                    v: params,
+                    span: self.new_span(span_start, finish),
+                    variadic,
+                });
+            }
+
+            params.push_back(self.fn_param()?);
+
+            if !self.consume_list_separator(&TokenKind::CloseParen)? {
+                let finish = self.consume(&TokenKind::CloseParen)?.finish;
+                break Ok(Params {
+                    v: params,
+                    span: self.new_span(span_start, finish),
+                    variadic: VariadicKind::None,
+                });
+            }
+        }
+    }
+
+    fn fn_param(&mut self) -> ParseResult<Param> {
+        let name = self.ident()?;
+
+        self.consume(&TokenKind::Colon)?;
+
+        let ty = self.ty()?;
+
+        let default = if self.consume_b(&TokenKind::Eq) {
+            Some(Rc::new(self.expr()?))
+        } else {
+            None
+        };
+
+        Ok(Param {
+            name,
+            ty: Rc::new(ty),
+            default,
+        })
+    }
+
+    fn vararg(&mut self) -> Option<VariadicKind> {
+        if self.consume_b(&TokenKind::DotDotDot) {
+            if let Ok(ident) = self.ident() {
+                Some(VariadicKind::Default(ident))
+            } else {
+                Some(VariadicKind::C)
+            }
+        } else {
+            None
+        }
+    }
+
+    fn enum_(&mut self, vis: Visibility) -> ParseResult<Enum> {
+        let start = self.consume(&TokenKind::Enum).unwrap().start;
+
+        let name = self.ident()?;
+
+        let generic_params = if self.check(&TokenKind::Lt) {
+            self.generic_params()?
+        } else {
+            None
+        };
+
+        // Push generic param names to determine if types is generic types.
+        if let Some(params) = &generic_params {
+            self.generic_param_names_stack
+                .push(params.params.iter().map(|p| p.name.symbol()).collect());
+        }
+
+        self.consume(&TokenKind::OpenBrace)?;
+
+        let variants = self.enum_variants()?;
+
+        let finish = self.consume(&TokenKind::CloseBrace)?.finish;
+
+        // Pop generic param names.
+        if generic_params.is_some() {
+            self.generic_param_names_stack.pop();
+        }
+
+        Ok(Enum {
+            vis,
+            name,
+            generic_params,
+            variants,
+            span: self.new_span(start, finish),
+        })
+    }
+
+    fn enum_variants(&mut self) -> ParseResult<Vec<EnumVariant>> {
+        let mut variants = Vec::new();
+
+        let mut offset = 0;
+
+        loop {
+            if self.check(&TokenKind::CloseBrace) {
+                break;
+            }
+
+            let name = self.ident()?;
+
+            let ty = if self.consume_b(&TokenKind::OpenParen) {
+                let ty = self.ty()?;
+                self.consume(&TokenKind::CloseParen)?;
+                Some(ty)
+            } else {
+                None
+            };
+
+            variants.push(EnumVariant {
+                name,
+                ty,
+                vis: Visibility::Public,
+                offset,
+            });
+
+            // Allow commas to be omitted only in the last variant.
+            if !self.consume_b(&TokenKind::Comma) {
+                self.consume_semi()?;
+                break;
+            }
+
+            offset += 1;
+        }
+
+        Ok(variants)
+    }
+
+    fn struct_(&mut self, vis: Visibility) -> ParseResult<Struct> {
+        let start = self.consume(&TokenKind::Struct).unwrap().start;
+
+        let name = self.ident()?;
+
+        let generic_params = if self.check(&TokenKind::Lt) {
+            self.generic_params()?
+        } else {
+            None
+        };
+
+        // Push generic param names to determine if types is generic types.
+        if let Some(params) = &generic_params {
+            self.generic_param_names_stack
+                .push(params.params.iter().map(|p| p.name.symbol()).collect());
+        }
+
+        self.consume(&TokenKind::OpenBrace)?;
+
+        let fields = self.struct_fields()?;
+
+        let finish = self.consume(&TokenKind::CloseBrace)?.finish;
+
+        let span = self.new_span(start, finish);
+
+        // Pop generic param names.
+        if generic_params.is_some() {
+            self.generic_param_names_stack.pop();
+        }
+
+        Ok(Struct {
+            vis,
+            name,
+            generic_params,
+            fields,
+            span,
+        })
+    }
+
+    fn struct_fields(&mut self) -> ParseResult<Vec<StructField>> {
+        let mut fields = Vec::new();
+
+        let mut offset = 0;
+
+        loop {
+            if self.check(&TokenKind::CloseBrace) {
+                break;
+            }
+
+            let name = self.ident()?;
+
+            self.consume(&TokenKind::Colon)?;
+
+            let ty = self.ty()?;
+
+            fields.push(StructField {
+                name,
+                ty: Rc::new(ty),
+                vis: Visibility::Public,
+                offset,
+            });
+
+            // Allow commas to be omitted only in the last field.
+            if !self.consume_b(&TokenKind::Comma) {
+                self.consume_semi()?;
+                break;
+            }
+
+            offset += 1;
+        }
+
+        Ok(fields)
+    }
+
+    fn interface(&mut self, vis: Visibility) -> ParseResult<Interface> {
+        let start = self.consume(&TokenKind::Interface).unwrap().start;
+
+        let name = self.ident()?;
+
+        self.consume(&TokenKind::OpenBrace)?;
+
+        let mut methods = Vec::new();
+
+        loop {
+            if self.check(&TokenKind::CloseBrace) {
+                break;
+            }
+
+            methods.push(self.interface_method()?);
+
+            if !self.check(&TokenKind::CloseBrace) {
+                self.consume_semi()?;
+            }
+        }
+
+        let finish = self.consume(&TokenKind::CloseBrace)?.finish;
+
+        Ok(Interface {
+            vis,
+            name,
+            methods,
+            span: self.new_span(start, finish),
+        })
+    }
+
+    fn interface_method(&mut self) -> ParseResult<InterfaceMethod> {
+        let start = self.consume(&TokenKind::Fun)?.start;
+
+        let name = self.ident()?;
+
+        let params_start = self.consume(&TokenKind::OpenParen)?.start;
+
+        let mutability = self.consume_b(&TokenKind::Mut).into();
+        let has_self = self.consume_b(&TokenKind::Self_);
+        if !has_self && mutability == Mutability::Mut {
+            return Err(ParseError::ExpectedError {
+                expected: "'self'".to_string(),
+                but: self.first().kind.to_string(),
+                span: self.first().span,
+            }
+            .into());
+        }
+
+        let first_param = if has_self {
+            let _ = self.consume_list_separator(&TokenKind::CloseParen)?;
+            None
+        } else if self.check(&TokenKind::CloseParen) {
+            None
+        } else {
+            let param = self.fn_param()?;
+            let _ = self.consume_list_separator(&TokenKind::CloseParen)?;
+            Some(param)
+        };
+
+        let params = {
+            let mut params = self.fn_params(params_start)?;
+            if let Some(first_param) = first_param {
+                params.v.push_front(first_param);
+            }
+            params
+        };
+
+        let (return_ty, finish) = if self.consume_b(&TokenKind::Arrow) {
+            let ret_ty = Rc::new(self.ty()?);
+            let finish = ret_ty.span.finish;
+            (ret_ty, finish)
+        } else {
+            let unit_span = self.new_span(params.span.finish, params.span.finish);
+            (Rc::new(Ty::new_unit(unit_span)), params.span.finish)
+        };
+
+        Ok(InterfaceMethod {
+            name,
+            self_: if has_self { Some(mutability) } else { None },
+            params,
+            return_ty,
+            span: self.new_span(start, finish),
+        })
+    }
+}

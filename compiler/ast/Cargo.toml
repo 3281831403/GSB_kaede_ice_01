@@ -1,0 +1,15 @@
+[package]
+name = "kaede_ast"
+version = "0.2.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+license = "MIT OR Apache-2.0"
+[dependencies]
+inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm17-0"] }
+
+kaede_ast_type = { path = "../ast_type" }
+kaede_span = { path = "../span" }
+kaede_symbol = { path = "../symbol" }
+kaede_common = { path = "../common" }

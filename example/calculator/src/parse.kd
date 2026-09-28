@@ -1,0 +1,129 @@
+import ast
+import tokenize
+
+use ast.*
+use tokenize.Token
+
+export struct Parser {
+    current_idx: u64,
+    tokens: Vector<Token>,
+}
+
+impl Parser {
+    export fun new() -> mut Parser {
+        return Parser {
+            current_idx: 0,
+            tokens: Vector<Token>::new(),
+        }
+    }
+
+    fun clear(mut self) {
+        self.current_idx = 0
+    }
+
+    fun increment_current_idx(mut self) {
+        self.current_idx += 1
+    }
+
+    fun consume(mut self, token: Token) -> bool {
+        current_token := self.tokens.at(self.current_idx)
+
+        return match current_token {
+            Option::Some(current_token) => {
+                if current_token.eq(token) {
+                    self.increment_current_idx()
+                    true
+                } else {
+                    false
+                }
+            },
+
+            Option::None => false,
+        }
+    }
+
+    fun expect_number(mut self) -> mut Node {
+        token := self.tokens.at(self.current_idx).unwrap()
+
+        match token {
+            Token::Num(n) => {
+                self.increment_current_idx()
+                return Node {
+                    kind: NodeKind::Num(n),
+                    left: Option<Node>::None,
+                    right: Option<Node>::None,
+                }
+            },
+
+            _ => {}
+        }
+
+        eprintln("expect number")
+        __unreachable()
+    }
+
+    export fun parse(mut self, tokens: Vector<Token>) -> Node {
+        self.clear()
+        self.tokens = tokens
+        return self.add_or_sub()
+    }
+
+
+    fun add_or_sub(mut self) -> mut Node {
+        mut node := self.mul_or_div()
+
+        loop {
+            if self.consume(Token::Add) {
+                node = Node {
+                    kind: NodeKind::Add,
+                    left: Option::Some(node),
+                    right: Option::Some(self.mul_or_div()),
+                }
+            } else if self.consume(Token::Sub) {
+                node = Node {
+                    kind: NodeKind::Sub,
+                    left: Option::Some(node),
+                    right: Option::Some(self.mul_or_div()),
+                }
+            } else {
+                return node
+            }
+        }
+
+        __unreachable()
+    }
+
+    fun mul_or_div(mut self) -> mut Node {
+        mut node := self.primary()
+
+        loop {
+            if self.consume(Token::Mul) {
+                node = Node {
+                    kind: NodeKind::Mul,
+                    left: Option::Some(node),
+                    right: Option::Some(self.primary()),
+                }
+            } else if self.consume(Token::Div) {
+                node = Node {
+                    kind: NodeKind::Div,
+                    left: Option::Some(node),
+                    right: Option::Some(self.primary()),
+                }
+            } else {
+                return node
+            }
+        }
+
+        __unreachable()
+    }
+
+    fun primary(mut self) -> mut Node {
+        if self.consume(Token::LParen) {
+            node := self.add_or_sub()
+            self.consume(Token::RParen)
+            return node
+        }
+
+        return self.expect_number()
+    }
+}

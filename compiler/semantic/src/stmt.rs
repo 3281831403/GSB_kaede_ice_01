@@ -1,0 +1,267 @@
+use crate::{SemanticAnalyzer, SemanticError};
+use kaede_symbol_table::{ConstValue, SymbolTableValue, SymbolTableValueKind, VariableInfo};
+
+use kaede_ast as ast;
+use kaede_ir::{self as ir, stmt::AssignOp};
+
+enum LetResult {
+    NormalLet(ir::stmt::Let),
+    TupleUnpack(ir::stmt::TupleUnpack),
+}
+
+impl SemanticAnalyzer {
+    pub fn analyze_stmt(&mut self, stmt: &ast::stmt::Stmt) -> anyhow::Result<ir::stmt::Stmt> {
+        use kaede_ast::stmt::StmtKind;
+
+        Ok(match &stmt.kind {
+            StmtKind::Expr(expr) => ir::stmt::Stmt::Expr(self.analyze_expr(expr)?.into()),
+
+            StmtKind::Let(node) => match self.analyze_let(node)? {
+                LetResult::NormalLet(let_stmt) => ir::stmt::Stmt::Let(let_stmt),
+                LetResult::TupleUnpack(tuple_unpack_stmt) => {
+                    ir::stmt::Stmt::TupleUnpack(tuple_unpack_stmt)
+                }
+            },
+
+            StmtKind::Const(node) => ir::stmt::Stmt::Let(self.analyze_const(node)?),
+
+            StmtKind::Assign(node) => ir::stmt::Stmt::Assign(self.analyze_assign(node)?),
+        })
+    }
+
+    fn analyze_assign(&mut self, node: &ast::stmt::Assign) -> anyhow::Result<ir::stmt::Assign> {
+        let left = self.analyze_expr(&node.lhs)?;
+
+        if left.ty.mutability.is_not() {
+            return Err(SemanticError::CannotAssignTwiceToImutable { span: node.span }.into());
+        }
+
+        let right = self.analyze_expr(&node.rhs)?;
+        let right = self.coerce_to_expected_type(right, &left.ty)?;
+
+        if !ir::ty::is_same_type(&left.ty, &right.ty) {
+            return Err(SemanticError::MismatchedTypes {
+                types: (left.ty.kind.to_string(), right.ty.kind.to_string()),
+                span: node.span,
+            }
+            .into());
+        }
+
+        let op = match node.op {
+            ast::stmt::AssignOp::Eq => AssignOp::Replace,
+            ast::stmt::AssignOp::AddAssign => AssignOp::Add,
+            ast::stmt::AssignOp::SubAssign => AssignOp::Sub,
+            ast::stmt::AssignOp::MulAssign => AssignOp::Mul,
+            ast::stmt::AssignOp::DivAssign => AssignOp::Div,
+            ast::stmt::AssignOp::RemAssign => AssignOp::Rem,
+        };
+
+        Ok(ir::stmt::Assign {
+            assignee: left,
+            value: right,
+            op,
+            span: node.span,
+        })
+    }
+
+    fn analyze_let(&mut self, node: &ast::stmt::Let) -> anyhow::Result<LetResult> {
+        use kaede_ast::stmt::LetKind;
+
+        Ok(match &node.kind {
+            LetKind::NormalLet(node) => LetResult::NormalLet(self.analyze_normal_let(node)?),
+            LetKind::TupleUnpack(node) => {
+                LetResult::TupleUnpack(self.analyze_tuple_unpacking(node)?)
+            }
+        })
+    }
+
+    fn analyze_normal_let(&mut self, node: &ast::stmt::NormalLet) -> anyhow::Result<ir::stmt::Let> {
+        if let Some(init) = &node.init {
+            let mutability = node.mutability;
+            let span = node.span;
+
+            // Drive interface coercion from the type annotation when one is present.
+            let (init, annotated_ty) = if node.ty.kind.is_inferred() {
+                (self.analyze_expr(init)?, None)
+            } else {
+                let annotated = self.analyze_type(&node.ty)?;
+                let init = self.analyze_expr_with_expected_type(init, annotated.clone())?;
+                (init, Some(annotated))
+            };
+
+            if matches!(init.ty.kind.as_ref(), ir::ty::TyKind::Reference(_))
+                && mutability.is_mut()
+                && init.ty.mutability.is_not()
+            {
+                return Err(SemanticError::CannotAssignImmutableToMutable { span }.into());
+            }
+
+            // Determine the variable type
+            let var_ty = if let Some(annotated) = annotated_ty {
+                ir::ty::change_mutability_dup(annotated, mutability.into())
+            } else if matches!(init.ty.kind.as_ref(), ir::ty::TyKind::Var(_)) {
+                // No type annotation and init is a type variable: defer to type inference.
+                ir::ty::change_mutability_dup(self.infer_context.fresh(), mutability.into())
+            } else {
+                ir::ty::change_mutability_dup(init.ty.clone(), mutability.into())
+            };
+
+            // Insert the variable into the symbol table
+            self.insert_symbol_to_current_scope(
+                node.name.symbol(),
+                SymbolTableValue::new(
+                    SymbolTableValueKind::Variable(VariableInfo::new(var_ty.clone())),
+                    self.current_module_path().clone(),
+                ),
+                span,
+            )?;
+
+            Ok(ir::stmt::Let {
+                name: node.name.symbol(),
+                ty: var_ty,
+                init: Some(init),
+                span: node.span,
+            })
+        } else {
+            todo!()
+        }
+    }
+
+    fn analyze_const(&mut self, node: &ast::stmt::Const) -> anyhow::Result<ir::stmt::Let> {
+        if !self.is_const_initializer(&node.init) {
+            return Err(SemanticError::ConstInitializerNotConst {
+                span: node.init.span,
+            }
+            .into());
+        }
+
+        let (init, const_ty) = if node.ty.kind.is_inferred() {
+            let init = self.analyze_expr(&node.init)?;
+            let inferred = if matches!(init.ty.kind.as_ref(), ir::ty::TyKind::Var(_)) {
+                self.infer_context.fresh()
+            } else {
+                init.ty.clone()
+            };
+            (
+                init,
+                ir::ty::change_mutability_dup(inferred, ir::ty::Mutability::Not),
+            )
+        } else {
+            let annotated = self.analyze_type(&node.ty)?;
+            let init = self.analyze_expr_with_expected_type(&node.init, annotated.clone())?;
+            (
+                init,
+                ir::ty::change_mutability_dup(annotated, ir::ty::Mutability::Not),
+            )
+        };
+        let const_value = self
+            .evaluate_integer_const_expr(&node.init)
+            .map(ConstValue::Integer);
+
+        self.insert_symbol_to_current_scope(
+            node.name.symbol(),
+            SymbolTableValue::new(
+                SymbolTableValueKind::Variable(VariableInfo::new_const(
+                    const_ty.clone(),
+                    const_value,
+                )),
+                self.current_module_path().clone(),
+            ),
+            node.span,
+        )?;
+
+        // Local consts share the existing immutable-local IR. The extra
+        // const-specific rules are enforced before this lowering step.
+        Ok(ir::stmt::Let {
+            name: node.name.symbol(),
+            ty: const_ty,
+            init: Some(init),
+            span: node.span,
+        })
+    }
+
+    fn analyze_tuple_unpacking(
+        &mut self,
+        node: &ast::stmt::TupleUnpack,
+    ) -> anyhow::Result<ir::stmt::TupleUnpack> {
+        let tuple = self.analyze_expr(&node.init)?;
+
+        let tuple_ref_ty = tuple.ty.as_ref();
+
+        let (element_types, tuple_mutability) = if let ir::ty::TyKind::Reference(rty) =
+            tuple_ref_ty.kind.as_ref()
+        {
+            match rty.refee_ty.kind.as_ref() {
+                ir::ty::TyKind::Tuple(element_types) => (element_types, tuple_ref_ty.mutability),
+
+                _ => todo!("Error"),
+            }
+        } else {
+            todo!("Error")
+        };
+
+        let element_len = element_types.len();
+
+        if node.names.len() != element_len {
+            return Err(SemanticError::NumberOfTupleFieldsDoesNotMatch {
+                lens: (node.names.len(), element_len),
+                span: node.span,
+            }
+            .into());
+        }
+
+        let mut names = Vec::with_capacity(node.names.len());
+
+        for (index, name_and_mutability) in node.names.iter().enumerate() {
+            let mutability = match name_and_mutability {
+                Some(x) => {
+                    let name = x.0.symbol();
+
+                    self.insert_symbol_to_current_scope(
+                        name,
+                        SymbolTableValue::new(
+                            SymbolTableValueKind::Variable(VariableInfo::new(
+                                element_types[index].clone(),
+                            )),
+                            self.current_module_path().clone(),
+                        ),
+                        node.span,
+                    )?;
+
+                    names.push(Some(name));
+                    x.1
+                }
+
+                // Ignore field
+                None => {
+                    names.push(None);
+                    continue;
+                }
+            };
+
+            if mutability.is_mut() && tuple_mutability.is_not() {
+                todo!("Error")
+            }
+        }
+
+        Ok(ir::stmt::TupleUnpack {
+            names,
+            init: tuple,
+            span: node.span,
+        })
+    }
+
+    pub fn analyze_block(&mut self, block: &ast::stmt::Block) -> anyhow::Result<ir::stmt::Block> {
+        let mut stmts = Vec::new();
+
+        for stmt in block.body.iter() {
+            stmts.push(self.analyze_stmt(stmt)?);
+        }
+
+        Ok(ir::stmt::Block {
+            body: stmts,
+            last_expr: None,
+            span: block.span,
+        })
+    }
+}

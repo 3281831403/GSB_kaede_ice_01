@@ -1,0 +1,258 @@
+mod error;
+mod expr;
+mod stmt;
+mod top;
+mod ty;
+
+use std::collections::VecDeque;
+
+pub use error::ParseError;
+use error::ParseResult;
+use kaede_ast::{expr::Expr, CompileUnit};
+use kaede_lex::{
+    token::{Token, TokenKind},
+    Lexer,
+};
+use kaede_span::{file::FilePath, Location, Span};
+use kaede_symbol::Symbol;
+
+pub struct Parser {
+    file: FilePath,
+
+    tokens: VecDeque<Token>,
+    consumed_tokens: VecDeque<Token>,
+    // Stack of checkpoints - each checkpoint records the number of elements in consumed_tokens.
+    checkpoint_stack: Vec<usize>,
+
+    end_token: Option<Token>,
+
+    in_cond_expr: bool,
+
+    generic_param_names_stack: Vec<Vec<Symbol>>,
+
+    imported_modules: Vec<Symbol>,
+}
+
+impl Parser {
+    pub fn new(source: &str, file: FilePath) -> Self {
+        Self {
+            tokens: Lexer::new(source, file).run(),
+            consumed_tokens: VecDeque::new(),
+            checkpoint_stack: Vec::new(),
+            end_token: None,
+            in_cond_expr: false,
+            generic_param_names_stack: Vec::new(),
+            file,
+            imported_modules: Vec::new(),
+        }
+    }
+
+    pub fn run(&mut self) -> ParseResult<CompileUnit> {
+        self.compile_unit(|self_| !self_.is_eof())
+    }
+
+    /// The argument specifies the condition under which the parsing is terminated
+    ///
+    /// When using "self", use the argument self
+    ///
+    /// Example:
+    /// |self_| self_.xxx()
+    fn compile_unit(
+        &mut self,
+        mut end_predicate: impl FnMut(&mut Self) -> bool,
+    ) -> ParseResult<CompileUnit> {
+        let mut compile_unit = CompileUnit {
+            items: VecDeque::new(),
+        };
+
+        while end_predicate(self) {
+            let item = self.module_item()?;
+
+            compile_unit.items.push_back(item);
+        }
+
+        Ok(compile_unit)
+    }
+
+    /// Needed to **avoid confusion** between struct literals and block statements
+    ///
+    /// if x {}
+    ///
+    /// In such code as above,
+    /// `then block` of `if statement` is not parsed as an initializer of a struct literals
+    fn cond_expr(&mut self) -> ParseResult<Expr> {
+        self.in_cond_expr = true;
+        let cond = self.expr();
+        self.in_cond_expr = false;
+        cond
+    }
+
+    fn is_eof(&mut self) -> bool {
+        self.end_token.is_some() || self.first().kind == TokenKind::Eoi
+    }
+
+    fn first(&mut self) -> &Token {
+        self.tokens
+            .front()
+            .unwrap_or_else(|| self.end_token.as_ref().unwrap())
+    }
+
+    /// Advance to next token
+    fn bump(&mut self) -> Option<Token> {
+        let token = self.tokens.pop_front();
+
+        // Record the consumed token
+        if let Some(token) = &token {
+            self.consumed_tokens.push_back(token.clone());
+        }
+
+        if let Some(token) = &token {
+            if token.kind == TokenKind::Eoi {
+                self.end_token = Some(token.clone());
+            }
+        }
+
+        token
+    }
+
+    // Create a checkpoint.
+    fn checkpoint(&mut self) {
+        self.checkpoint_stack.push(self.consumed_tokens.len());
+    }
+
+    // Backtrack to the most recent checkpoint.
+    fn backtrack(&mut self) {
+        let checkpoint = self
+            .checkpoint_stack
+            .pop()
+            .expect("Attempted to backtrack without a checkpoint");
+
+        let len = self.consumed_tokens.len();
+        let diff = len - checkpoint;
+
+        for _ in 0..diff {
+            self.tokens
+                .push_front(self.consumed_tokens.pop_back().unwrap());
+        }
+    }
+
+    // Discard the most recent checkpoint without backtracking.
+    // Call this when a speculative parse succeeded.
+    fn discard_checkpoint(&mut self) {
+        self.checkpoint_stack
+            .pop()
+            .expect("Attempted to discard checkpoint without a checkpoint");
+    }
+
+    /// Check without consuming tokens
+    fn check(&mut self, tok: &TokenKind) -> bool {
+        &self.first().kind == tok
+    }
+
+    fn consume(&mut self, tok: &TokenKind) -> ParseResult<Span> {
+        let span = self.first().span;
+
+        if &self.first().kind == tok {
+            self.bump().unwrap();
+            return Ok(span);
+        }
+
+        Err(ParseError::ExpectedError {
+            expected: tok.to_string(),
+            but: self.first().kind.to_string(),
+            span: self.first().span,
+        }
+        .into())
+    }
+
+    /// Return boolean
+    fn consume_b(&mut self, tok: &TokenKind) -> bool {
+        if &self.first().kind == tok {
+            self.bump().unwrap();
+            return true;
+        }
+
+        false
+    }
+
+    fn consume_semis(&mut self) {
+        while self.consume_b(&TokenKind::Semi) {}
+    }
+
+    /// Consume the separator after an item in a comma-separated list.
+    ///
+    /// Newlines may be inserted as `Semi` tokens before the comma or closing
+    /// delimiter. Returning `false` means the caller is positioned at `end`.
+    fn consume_list_separator(&mut self, end: &TokenKind) -> ParseResult<bool> {
+        self.consume_semis();
+
+        if self.check(end) {
+            return Ok(false);
+        }
+
+        self.consume(&TokenKind::Comma)?;
+        self.consume_semis();
+
+        Ok(!self.check(end))
+    }
+
+    /// Consume a semicolon
+    /// ')' or '}', then success (Following Golang's rules)
+    fn consume_semi(&mut self) -> ParseResult<Span> {
+        if let Ok(span) = self.consume(&TokenKind::Semi) {
+            return Ok(span);
+        }
+
+        if self.check(&TokenKind::CloseParen) || self.check(&TokenKind::CloseBrace) {
+            return Ok(self.first().span);
+        }
+
+        Err(ParseError::ExpectedError {
+            expected: TokenKind::Semi.to_string(),
+            but: self.first().kind.to_string(),
+            span: self.first().span,
+        }
+        .into())
+    }
+
+    /// Check a semicolon (Not consumed)
+    /// ')' or '}', then success (Following Golang's rules)
+    fn check_semi(&mut self) -> bool {
+        if self.check(&TokenKind::Semi)
+            || (self.check(&TokenKind::CloseParen) || self.check(&TokenKind::CloseBrace))
+        {
+            return true;
+        }
+
+        false
+    }
+
+    fn new_span(&self, start: Location, finish: Location) -> Span {
+        Span::new(start, finish, self.file)
+    }
+}
+
+pub(crate) fn parse_int_literal_u64(literal: &str) -> Option<u64> {
+    if let Some(hex_digits) = literal
+        .strip_prefix("0x")
+        .or_else(|| literal.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex_digits, 16).ok();
+    }
+
+    literal.parse().ok()
+}
+
+pub(crate) fn parse_int_literal_u32(literal: &str) -> Option<u32> {
+    let value = parse_int_literal_u64(literal)?;
+
+    if value > u32::MAX as u64 {
+        return None;
+    }
+
+    Some(value as u32)
+}
+
+pub(crate) fn parse_float_literal_f64(literal: &str) -> Option<f64> {
+    literal.parse().ok().filter(|v: &f64| v.is_finite())
+}
